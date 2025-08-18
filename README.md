@@ -1,6 +1,6 @@
-# QDOS - GraphQL DoS Testing Tool
+# GDoS - GraphQL DoS Testing Tool
 
-QDOS (Quick DoS) is a powerful and flexible tool for penetration testers and security professionals to perform Denial of Service (DoS) testing on GraphQL endpoints. It allows testing of various GraphQL vulnerabilities through multiple attack types, including Directive Overloading, Deep Introspection, Cyclic Query Attacks, and Batching Attacks.
+GDoS (GraphQL DoS) is a powerful and flexible tool for penetration testers and security professionals to perform Denial of Service (DoS) testing on GraphQL endpoints. It allows testing of various GraphQL vulnerabilities through multiple attack types, including Directive Overloading, Deep Introspection, Cyclic Query Attacks, and Batching Attacks.
 
 This tool is designed to be flexible, user-friendly, and easy to use, enabling security professionals to easily execute complex DoS tests against GraphQL servers.
 
@@ -34,7 +34,7 @@ pip install requests
 ### Run the Program: After cloning this repository, you can run the program with the following command:
 
 ```bash
-python qdos.py
+python gdos.py
 ```
 ### Input Headers: When prompted, you can choose between:
 
