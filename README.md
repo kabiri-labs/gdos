@@ -1,89 +1,132 @@
-# GDoS - GraphQL DoS Testing Tool
+# GDoS — GraphQL DoS Resilience Scanner
 
-GDoS (GraphQL DoS) is a powerful and flexible tool for penetration testers and security professionals to perform Denial of Service (DoS) testing on GraphQL endpoints. It allows testing of various GraphQL vulnerabilities through multiple attack types, including Directive Overloading, Deep Introspection, Cyclic Query Attacks, and Batching Attacks.
+GDoS audits a GraphQL endpoint for **Denial-of-Service (DoS) amplification
+vulnerabilities** and reports whether the server enforces the protections a
+production deployment needs. Its purpose is *defensive*: to give security
+engineers and developers confidence that their GraphQL API **cannot** be
+trivially knocked over by a single malicious query.
 
-This tool is designed to be flexible, user-friendly, and easy to use, enabling security professionals to easily execute complex DoS tests against GraphQL servers.
+Unlike a flooding tool, GDoS sends **bounded, single-shot probes** — one
+crafted request per attack vector — and classifies the server's response as
+`PROTECTED`, `VULNERABLE`, `INCONCLUSIVE`, or `ERROR`. It never loops, never
+escalates automatically, and always honours a hard per-request timeout.
 
-## Features
+> ⚠️ **Authorized use only.** GDoS sends deliberately abusive (but bounded)
+> payloads. Only run it against endpoints you own or are explicitly authorized
+> to test.
 
-- **Multiple Attack Types**: Supports four different DoS attack strategies on GraphQL endpoints:
-  1. **Directive Overloading**: Overload the GraphQL endpoint with excessive directives.
-  2. **Deep Introspection**: Perform a recursive introspection query to stress the server.
-  3. **Cyclic Query Attack**: Trigger cyclic queries that can exhaust the server’s resources.
-  4. **Batching Attack**: Send batched queries to overload the server.
-  
-- **User-Friendly Header Input**: 
-  - Enter just the **Authorization token** or **paste full headers** from tools like Burp Suite.
-  - The tool will intelligently use default headers or allow you to customize them.
+## Attack vectors checked
 
-- **Flexible Configuration**: 
-  - Set the **number of threads** and **request delay** to simulate real-world traffic.
-  - Test different endpoints with customized settings.
+| Vector | What it tests | A hardened server should… |
+| --- | --- | --- |
+| **Schema introspection exposure** | Whether the full schema is readable | Disable introspection in production |
+| **Query depth (deep nesting)** | Deeply nested selection sets | Reject queries past a max depth |
+| **Recursive introspection** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
+| **Alias-based amplification** | Hundreds/thousands of aliases of one field | Enforce an alias-count / node limit |
+| **Field duplication** | The same field repeated many times | Count duplicates in a complexity budget |
+| **Directive overloading** | A field annotated with thousands of directives | Limit directives / query token length |
+| **Array request batching** | A JSON array of many operations in one request | Cap or disable batch size |
+| **Circular fragment spread** | A self-referential fragment (spec-forbidden) | Reject during validation |
+
+The probes rely only on the universal GraphQL meta-fields (`__typename`,
+`__type`, `__schema`), so they work against **any** spec-compliant endpoint
+without prior knowledge of its schema.
+
+## How a verdict is reached
+
+1. GDoS first measures a **baseline** round-trip with a trivial query.
+2. Each check sends its abusive probe and inspects the result:
+   - A validation/limit error (e.g. *"query depth exceeds maximum"*), a `429`,
+     or a rejected batch → **PROTECTED**.
+   - The probe being accepted and executed, a `5xx`, a timeout, or a response
+     significantly slower than the baseline → **VULNERABLE**.
+   - Anything ambiguous (auth required, unexpected shape) → **INCONCLUSIVE**.
 
 ## Requirements
 
-- Python 3.x
-- `requests` library
+- Python 3.10+
+- `requests`
 
-To install the necessary dependencies, run the following command:
 ```bash
-pip install requests
+pip install -r requirements.txt
+# or install as a package (provides the `gdos` command):
+pip install -e .
 ```
 
 ## Usage
-### Run the Program: After cloning this repository, you can run the program with the following command:
 
 ```bash
-python gdos.py
+python -m gdos https://api.example.com/graphql
+# or, if installed:
+gdos https://api.example.com/graphql
 ```
-### Input Headers: When prompted, you can choose between:
 
-- Entering a token (only the Authorization header is required).
-- Pasting all headers from a tool like Burp Suite or Postman.
+### Common options
 
-### Choose Attack Type: You will be prompted to select the attack type by entering a number:
+```text
+positional:
+  url                     GraphQL endpoint URL
 
-1: Directive Overloading
-2: Deep Introspection Query
-3: Cyclic Query Attack
-4: Batching Attack
-
-- **Configure Threads and Delay**: Specify the number of threads (default is 10) and the delay between requests (default is 0 seconds).
-
--  **Run the Attack**: Once you enter all the details, the script will execute the selected attack, providing output for each request sent, including status codes and response snippets.
-
-## Example Usage
-1. Enter the URL and headers:
+options:
+  -H, --header 'K: V'     extra HTTP header (repeatable)
+  --token TOKEN           shortcut for 'Authorization: Bearer <token>'
+  --intensity {low,medium,high}
+                          probe magnitude (depth/alias/batch sizes). Default: medium
+  --timeout SECONDS       per-request timeout (default: 15)
+  --baseline-samples N    warm-up requests for the baseline (default: 3)
+  --insecure              disable TLS verification (not recommended)
+  --json                  emit a machine-readable JSON report
+  --no-color              plain text output
+  -v, --verbose           progress logging
+  -y, --yes               acknowledge the authorization notice (for non-interactive use)
 ```
-Enter GraphQL URL (for example: https://api.example.com/graphql): https://graphql.example.com/api
-Would you like to enter just the token (1) or paste all headers (2)? Enter 1 or 2: 1
-Enter your Authorization token (without 'Bearer '): ABCD1234
-```
-2. Select Attack Type:
-```
-Select the attack type:
-1. Directive Overloading
-2. Deep Introspection Query
-3. Cyclic Query Attack
-4. Batching Attack
-Enter the number of the test type: 1
-```
-3. Set Threads and Delay:
-```
-Enter number of threads (default 10): 5
-Enter request delay (seconds, default 0.0): 1.0
-```
-The program will now execute the selected attack, printing status messages and response snippets to the terminal.
 
-## Code Structure
-- `get_headers_input`: Handles intelligent header input, allowing users to provide either just a token or paste full headers.
-- `GraphQLDoSTest`: The base class for all DoS tests, defining the common structure and methods.
-- `DirectiveOverloadingTest`, `DeepIntrospectionTest`, `CyclicQueryAttackTest`, `BatchingAttackTest`: These are subclasses of GraphQLDoSTest, each implementing a specific DoS attack type.
-- **Multithreading**: Uses Python's threading module to simulate concurrent requests for high-load scenarios.
-- **User Input**: Prompts the user for necessary details such as URL, headers, attack type, number of threads, and request delay.
+### Examples
 
-## Contributing
-If you would like to contribute to the development of this tool, please feel free to fork the repository, create a pull request, or submit issues for bug reports or feature requests.
+```bash
+# Authenticated scan, high intensity, human-readable report
+python -m gdos https://api.example.com/graphql \
+  --token "$API_TOKEN" --intensity high --yes
+
+# CI gate: JSON output, non-zero exit if any vulnerability is found
+python -m gdos https://api.example.com/graphql --yes --json > report.json
+```
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | No DoS exposure detected |
+| `1` | At least one vulnerability found |
+| `2` | Bad arguments |
+| `3` | Authorization not confirmed |
+
+This makes GDoS easy to wire into CI to **fail a build** when a GraphQL service
+regresses on its DoS protections.
+
+## Project layout
+
+```
+gdos/
+  client.py        # bounded, timeout-aware GraphQL HTTP client
+  scanner.py       # baseline measurement + check orchestration
+  reporting.py     # text / JSON report rendering
+  cli.py           # argparse command-line interface
+  checks/          # one module per attack vector
+    base.py        # Check base class + verdict classification
+    introspection.py
+    amplification.py
+    batching.py
+tests/             # unit tests for the classification logic (no network needed)
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
 
 ## License
-This project is licensed under the MIT License.
+
+MIT — see [LICENSE](LICENSE).
