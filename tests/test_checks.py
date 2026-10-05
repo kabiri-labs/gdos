@@ -124,6 +124,44 @@ def test_rejection_classification(resp, expected):
     assert classify_rejection(resp) is expected
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "You are not authorized to access this resource",
+        "The current user is not authorised",
+        "Authentication required",
+        "This endpoint requires authentication",
+        "You are not allowed to access field 'secret'",
+        "You have no permission to run this query",
+    ],
+)
+def test_spaced_authorization_failures_are_auth(message):
+    """Regression: a word-boundary match on `unauthorized` misses `not authorized`.
+
+    Such a message used to fall through to VALIDATION, which amplification
+    checks read as PROTECTED — recreating the false-clean auth result.
+    """
+    resp = gql(json={"errors": [{"message": message}], "data": None})
+    assert classify_rejection(resp) is Rejection.AUTH
+
+
+def test_not_allowed_without_access_is_still_a_limit():
+    """The narrow auth phrase must not swallow genuine limit messages."""
+    resp = gql(
+        status=400, json={"errors": [{"message": "Batching is not allowed"}]}
+    )
+    assert classify_rejection(resp) is Rejection.LIMIT
+
+
+def test_spaced_auth_failure_is_inconclusive_not_protected():
+    resp = gql(
+        json={"errors": [{"message": "You are not authorized to access this"}],
+              "data": None}
+    )
+    result = QueryDepthCheck().run(FakeClient(resp), baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
 def test_auth_rejection_outranks_limit_vocabulary():
     """An auth wall saying "not allowed" must not read as a DoS control."""
     resp = gql(status=200, json={"errors": [{"message": "Access denied: not allowed"}]})
@@ -252,11 +290,28 @@ def test_slow_probe_with_fast_control_is_vulnerable():
 
 
 def test_slow_probe_with_slow_control_is_inconclusive():
-    """Endpoint-wide degradation is not attributable to the payload."""
+    """Endpoint-wide degradation is not attributable to the payload.
+
+    The endpoint is still answering, so the scan carries on.
+    """
     probe = gql(json={"data": {"__type": {"name": "String"}}}, elapsed=5.0)
     result = QueryDepthCheck().run(FakeClient(probe, healthy(6.0)), baseline=0.05)
     assert result.verdict is Verdict.INCONCLUSIVE
     assert result.evidence["control_probe"] == "degraded"
+    assert result.abort_scan is False
+
+
+def test_slow_probe_with_dead_control_aborts():
+    """Regression: a slow probe whose control dies must stop the scan.
+
+    Every other path aborts when the control query fails. This one used to
+    return INCONCLUSIVE and let the scanner keep firing abusive payloads at an
+    endpoint that had just stopped responding.
+    """
+    probe = gql(json={"data": {"__type": {"name": "String"}}}, elapsed=5.0)
+    result = QueryDepthCheck().run(FakeClient(probe, timed_out()), baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.abort_scan is True
 
 
 def test_server_error_with_healthy_control_is_vulnerable():
@@ -512,6 +567,64 @@ def test_scan_aborts_and_marks_the_rest_skipped():
     assert report.results[-1].verdict is Verdict.INCONCLUSIVE
     assert "Not run" in report.results[-1].summary
     assert report.is_conclusive is False
+
+
+class PhasedClient:
+    """Healthy baseline, one check that passes, then a dead endpoint."""
+
+    url = "http://example.test/graphql"
+
+    def query(self, query: str, variables=None) -> GraphQLResponse:
+        if "GdosBaseline" in query:
+            return healthy()
+        if "GdosIntrospectionProbe" in query:
+            return gql(
+                status=400,
+                json={"errors": [{"message": "introspection is disabled"}]},
+            )
+        return timed_out()
+
+    def post(self, payload) -> GraphQLResponse:
+        return timed_out()
+
+
+def test_aborted_scan_is_never_conclusive_even_with_a_protected_check():
+    """Regression: a partial scan must not produce a clean CI result.
+
+    One PROTECTED verdict before the abort used to satisfy `is_conclusive`,
+    so `exit_code` returned 0 and the report read "no DoS exposure detected"
+    while most vectors were never probed at all.
+    """
+    report = Scanner(PhasedClient(), baseline_samples=1, delay=0).run()
+
+    assert report.aborted is True
+    assert report.is_vulnerable is False
+    assert any(r.verdict is Verdict.PROTECTED for r in report.results)
+    assert report.is_conclusive is False
+    assert exit_code(report) == 4
+    assert "no DoS exposure detected" not in to_text(report, color=False)
+
+
+def test_abort_after_a_vulnerability_still_exits_one():
+    """Guarding the fix: `is_vulnerable` is tested before `is_conclusive`."""
+
+    class VulnerableThenDead:
+        url = "http://example.test/graphql"
+
+        def query(self, query: str, variables=None) -> GraphQLResponse:
+            if "GdosBaseline" in query:
+                return healthy()
+            if "GdosIntrospectionProbe" in query:
+                return gql(json={"data": {"__schema": {"types": [{"name": "Q"}]}}})
+            return timed_out()
+
+        def post(self, payload) -> GraphQLResponse:
+            return timed_out()
+
+    report = Scanner(VulnerableThenDead(), baseline_samples=1, delay=0).run()
+    assert report.aborted is True
+    assert report.is_vulnerable is True
+    assert exit_code(report) == 1
 
 
 def test_clean_scan_is_conclusive():

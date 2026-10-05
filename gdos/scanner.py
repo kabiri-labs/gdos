@@ -41,15 +41,25 @@ class ScanReport:
 
     @property
     def is_conclusive(self) -> bool:
-        """True if the scan produced at least one verdict worth acting on.
+        """True if the scan covered the endpoint and produced actionable verdicts.
 
         A scan where every check came back INCONCLUSIVE or ERROR — an auth
         wall, a throttle, a dead endpoint — proves nothing. Reporting that as
         "no DoS exposure detected" would hand a CI pipeline a false clean bill
         of health, so callers must be able to tell the two apart.
+
+        An aborted scan is inconclusive even when the checks that did run came
+        back PROTECTED: the vectors after the abort were never probed, so the
+        endpoint has not been cleared. This does not mask a vulnerability found
+        before the abort, because callers test ``is_vulnerable`` first.
         """
-        return self.baseline_ok and any(
-            r.verdict in (Verdict.PROTECTED, Verdict.VULNERABLE) for r in self.results
+        return (
+            self.baseline_ok
+            and not self.aborted
+            and any(
+                r.verdict in (Verdict.PROTECTED, Verdict.VULNERABLE)
+                for r in self.results
+            )
         )
 
     def counts(self) -> dict[str, int]:
