@@ -100,6 +100,13 @@ _AUTH_PHRASES = _phrases(
     "permission denied", "insufficient permission", "not permitted",
     "must be logged in", "login required", "invalid token", "expired token",
     "invalid api key", "missing api key", "missing credentials",
+    # Spaced forms. "unauthorized" does not match "not authorized", and a
+    # message that falls through to VALIDATION is read as a refusal by a DoS
+    # control — which is exactly the false-clean auth result to avoid.
+    "not authorized", "not authorised", "no permission",
+    # Narrower than the bare "not allowed" in _LIMIT_PHRASES on purpose, so
+    # "batching is not allowed" still reads as a limit rather than an auth wall.
+    "not allowed to access",
 )
 
 _RATE_PHRASES = _phrases(
@@ -425,9 +432,15 @@ class Check:
         # the path where data came back.
         if self._is_slow(resp.elapsed, baseline):
             control = self._control(client)
-            if endpoint_healthy(control) and not self._is_slow(
-                control.elapsed, baseline
-            ):
+            if not endpoint_healthy(control):
+                # The endpoint has just stopped answering even trivial queries.
+                # Every other path treats that as a reason to stop; a slow
+                # probe is no exception, and continuing would fire the
+                # remaining payloads at a target that is already unwell.
+                return self._unreachable(
+                    resp, baseline, f"The {vector_label} probe was slow"
+                )
+            if not self._is_slow(control.elapsed, baseline):
                 # Absolute timings, not a ratio: against a sub-millisecond
                 # baseline a ratio reads as a meaningless four-digit number.
                 timing = (

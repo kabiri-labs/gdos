@@ -106,16 +106,25 @@ query** and decides from the contrast:
 | Timed out | **VULNERABLE** — the payload specifically exhausted it | **INCONCLUSIVE**, scan aborted |
 | `5xx` | **VULNERABLE** — the payload reached execution | **INCONCLUSIVE**, scan aborted |
 | `429` | **PROTECTED** — a cost-aware rate limit refused it | **INCONCLUSIVE**, scan aborted |
-| Slow | **VULNERABLE** — trivial queries stayed fast | **INCONCLUSIVE** — endpoint-wide degradation |
+| Slow | **VULNERABLE** — trivial queries stayed fast | **INCONCLUSIVE**, scan aborted |
+
+One case sits between the columns: a control query that still answers but is
+*itself* slow means the endpoint or network is degraded across the board. The
+slowdown cannot be blamed on the payload, so the verdict is **INCONCLUSIVE** —
+but the endpoint is alive, so the scan continues.
 
 Aborting matters in both directions: it keeps a scan from recording further
 verdicts that merely reflect a tripped rate limiter or a downed host, and it
-stops GDoS from continuing to probe an endpoint that is already unwell.
+stops GDoS from continuing to probe an endpoint that is already unwell. An
+aborted scan is always inconclusive, even if the checks that ran before it
+came back `PROTECTED`, because the vectors after the abort were never probed.
 
 ### What is *not* treated as protection
 
 - **An authentication failure is not a hardened endpoint.** A target that
-  rejects every probe with `401`/`403` reports `INCONCLUSIVE`, not `PROTECTED`.
+  rejects probes with `401`/`403`, or with a message like *"you are not
+  authorized to access this resource"* on an HTTP `200`, reports
+  `INCONCLUSIVE`, not `PROTECTED`.
 - **A served response is never keyword-matched.** Schema and data vocabulary
   such as `nodes`, `rateLimit` or `maximum` appears in perfectly ordinary
   results; only GraphQL `errors` messages (or the body of a non-2xx response,
@@ -194,9 +203,10 @@ regresses on its DoS protections.
 
 Exit code `4` is the difference between *"this endpoint is hardened"* and
 *"this endpoint never let us ask"*. A scan that hit an authentication wall, was
-throttled, or found the endpoint unreachable produces no conclusive verdict, so
-it exits `4` rather than `0` — a pipeline that treats any non-zero code as a
-failure will not go green on a scan that never happened.
+throttled, found the endpoint unreachable, or was aborted part-way through
+produces no conclusive verdict, so it exits `4` rather than `0` — a pipeline
+that treats any non-zero code as a failure will not go green on a scan that
+never happened.
 
 ## Project layout
 
