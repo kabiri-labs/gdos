@@ -93,6 +93,19 @@ class BatchingCheck(Check):
                 resp, baseline, f"The batch probe returned {resp.status_code}"
             )
 
+        if resp.truncated:
+            evidence["response_truncated"] = True
+            evidence["bytes_read"] = resp.bytes_read
+            return self._result(
+                Verdict.VULNERABLE,
+                f"A batch of {count} operations produced at least "
+                f"{resp.bytes_read} bytes and was still arriving when the read "
+                "cap stopped it — the batch was executed at scale.",
+                resp,
+                baseline,
+                evidence=evidence,
+            )
+
         # A server that accepts batching answers with a JSON array of results.
         # An array of *errors* is a rejection, not an execution, so count only
         # the entries that actually carry data.
@@ -241,6 +254,18 @@ class CircularFragmentCheck(Check):
                 )
             return self._unreachable(
                 resp, baseline, f"The circular-fragment probe returned {resp.status_code}"
+            )
+
+        if resp.truncated:
+            return self._result(
+                Verdict.VULNERABLE,
+                "A document containing a fragment cycle produced at least "
+                f"{resp.bytes_read} bytes and was still arriving when the read "
+                "cap stopped it — the cycle was executed and the output is "
+                "unbounded.",
+                resp,
+                baseline,
+                evidence={"response_truncated": True, "bytes_read": resp.bytes_read},
             )
 
         rejection = classify_rejection(resp)

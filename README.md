@@ -89,6 +89,7 @@ for all 8 vectors directly instead of fingerprinting versions.
      validator that burns CPU working through the payload before rejecting it
      can be driven just as hard as one that executes it; that is precisely
      CVE-2022-37734.
+   - The answer **hit the read cap** → **VULNERABLE**. See below.
    - The endpoint never exercised its DoS controls — an authentication wall, a
      throttle, a degraded or unreachable endpoint, an unexpected shape →
      **INCONCLUSIVE**.
@@ -118,6 +119,20 @@ verdicts that merely reflect a tripped rate limiter or a downed host, and it
 stops GDoS from continuing to probe an endpoint that is already unwell. An
 aborted scan is always inconclusive, even if the checks that ran before it
 came back `PROTECTED`, because the vectors after the abort were never probed.
+
+### Bounded reads
+
+The probes are amplification payloads, so the answer to one can be orders of
+magnitude larger than the request that caused it. GDoS reads at most
+`--max-response-bytes` (10 MB by default) and enforces `--timeout` across the
+whole transfer, not merely between chunks — otherwise a server dribbling bytes
+indefinitely would hold the scanner open for as long as it liked.
+
+Hitting the cap is **evidence, not an error**. A small probe that provoked more
+output than the scanner will hold is the amplification the check is looking
+for, so the verdict is `VULNERABLE` and the byte count is recorded. Raise the
+cap if you want the full body; against a server offering 310 MB in answer to
+one 40-line query, the scanner holds 10 MB and finishes in under a second.
 
 ### What is *not* treated as protection
 
@@ -167,6 +182,8 @@ options:
                           probe magnitude (depth/alias/batch sizes). Default: medium
   --timeout SECONDS       per-request timeout (default: 15)
   --baseline-samples N    warm-up requests for the baseline (default: 3)
+  --max-response-bytes N  stop reading a response body after N bytes
+                          (default: 10485760)
   --delay SECONDS         pause between checks, so the scan does not trip the
                           target's rate limiter (default: 0.5)
   --insecure              disable TLS verification (not recommended)

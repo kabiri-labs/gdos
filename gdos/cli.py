@@ -7,7 +7,7 @@ import logging
 import sys
 
 from gdos import __version__
-from gdos.client import GraphQLClient
+from gdos.client import DEFAULT_MAX_RESPONSE_BYTES, GraphQLClient
 from gdos.reporting import to_json, to_text
 from gdos.scanner import ScanReport, Scanner
 
@@ -64,6 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--delay", type=float, default=0.5,
         help="seconds to wait between checks, to avoid tripping the target's "
              "rate limiter mid-scan (default: 0.5)",
+    )
+    parser.add_argument(
+        "--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES,
+        metavar="N",
+        help="stop reading a response body after N bytes, so an amplified "
+             "answer cannot exhaust the scanner. Hitting the cap is reported "
+             f"as evidence, not an error (default: {DEFAULT_MAX_RESPONSE_BYTES})",
     )
     parser.add_argument(
         "--insecure", action="store_true",
@@ -138,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         headers=headers,
         timeout=args.timeout,
         verify_tls=not args.insecure,
+        max_response_bytes=args.max_response_bytes,
     )
     try:
         scanner = Scanner(

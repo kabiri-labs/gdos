@@ -67,6 +67,18 @@ class IntrospectionEnabledCheck(Check):
                 )
             return self._unreachable(resp, baseline, "The introspection probe timed out")
 
+        if resp.truncated:
+            return self._result(
+                Verdict.VULNERABLE,
+                "Introspection is ENABLED and the schema is large enough that "
+                f"the response hit the {resp.bytes_read} byte read cap — the "
+                "full type and field catalogue is readable by anyone, and "
+                "serving it is itself expensive.",
+                resp,
+                baseline,
+                evidence={"response_truncated": True, "bytes_read": resp.bytes_read},
+            )
+
         schema = (resp.data or {}).get("__schema")
         if schema:
             type_count = len(schema.get("types") or [])
