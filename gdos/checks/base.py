@@ -211,13 +211,26 @@ def response_indicates_limit(resp: "GraphQLResponse") -> bool:
 
 
 def endpoint_healthy(resp: "GraphQLResponse") -> bool:
-    """True if a trivial control query came back normally."""
+    """True if a trivial control query came back normally.
+
+    A control query asks for ``__typename`` and nothing else, so a body large
+    enough to hit the read cap means the endpoint is not answering normally.
+    """
     return (
         resp.error is None
         and not resp.timed_out
+        and not resp.truncated
         and resp.ok
         and not resp.graphql_errors
         and resp.has_data
+    )
+
+
+def _amplified_body(resp: "GraphQLResponse") -> str:
+    return (
+        f"{resp.bytes_read / (1024 * 1024):.1f} MB"
+        if resp.bytes_read >= 1024 * 1024
+        else f"{resp.bytes_read / 1024:.0f} KB"
     )
 
 
@@ -415,6 +428,21 @@ class Check:
                 )
             return self._unreachable(
                 resp, baseline, f"The {vector_label} probe returned {resp.status_code}"
+            )
+
+        # The body hit the read cap. It cannot be parsed, but it does not need
+        # to be: a small probe that provoked at least this much output is the
+        # amplification the check is looking for.
+        if resp.truncated:
+            return self._result(
+                Verdict.VULNERABLE,
+                f"Server answered the {vector_label} probe with at least "
+                f"{_amplified_body(resp)} and was still sending when the read "
+                "cap stopped it — a single small request produced an unbounded "
+                "response. Raise --max-response-bytes to capture the full body.",
+                resp,
+                baseline,
+                evidence={"response_truncated": True, "bytes_read": resp.bytes_read},
             )
 
         rejection = classify_rejection(resp)

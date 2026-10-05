@@ -4,15 +4,28 @@ The client is intentionally conservative: every request has a hard timeout and a
 single retry is *not* performed automatically, because the scanner needs to
 observe the raw behaviour of the server (including slow/failed responses) to
 judge resilience.
+
+Responses are read under a byte cap and a wall-clock deadline. The probes are
+amplification payloads, so the answer to one can be orders of magnitude larger
+than the request that caused it; buffering that whole answer would exhaust the
+scanner rather than reveal anything about the target. Hitting the cap is not an
+error — it is evidence, and the checks treat it as such.
 """
 
 from __future__ import annotations
 
+import json as jsonlib
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+
+DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+"""Generous enough for a full introspection of a very large schema, small
+enough that a runaway amplification cannot exhaust the scanner."""
+
+_READ_CHUNK = 64 * 1024
 
 
 @dataclass
@@ -27,6 +40,11 @@ class GraphQLResponse:
     timed_out: bool = False
     error: str | None = None
     """Set when the request never produced an HTTP response (network error)."""
+    truncated: bool = False
+    """The body hit the read cap. The server sent at least ``bytes_read``
+    bytes, so the payload was answered at scale even though the body could not
+    be parsed."""
+    bytes_read: int = 0
 
     @property
     def ok(self) -> bool:
@@ -71,19 +89,44 @@ class GraphQLClient:
         headers: dict[str, str] | None = None,
         timeout: float = 15.0,
         verify_tls: bool = True,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.verify_tls = verify_tls
+        self.max_response_bytes = max(1, max_response_bytes)
         self._session = requests.Session()
         default_headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "gdos-scanner/2.1 (+graphql-dos-resilience-scanner)",
+            "User-Agent": "gdos-scanner/2.2 (+graphql-dos-resilience-scanner)",
         }
         if headers:
             default_headers.update(headers)
         self._session.headers.update(default_headers)
+
+    def _read_body(self, resp: "requests.Response", start: float) -> tuple[bytes, bool]:
+        """Read at most ``max_response_bytes``, and never past the deadline.
+
+        Returns the bytes read and whether the cap stopped the read. The
+        deadline matters as much as the cap: ``timeout`` governs the wait
+        between chunks, not the transfer as a whole, so a server trickling
+        bytes indefinitely would otherwise hold the scanner open forever.
+        """
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=_READ_CHUNK):
+            if time.perf_counter() - start > self.timeout:
+                raise requests.exceptions.Timeout(
+                    "response body still arriving after the timeout"
+                )
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= self.max_response_bytes:
+                return b"".join(chunks)[: self.max_response_bytes], True
+        return b"".join(chunks), False
 
     def post(self, payload: dict[str, Any] | list[Any]) -> GraphQLResponse:
         """Send a JSON GraphQL payload and return a normalised response.
@@ -98,6 +141,7 @@ class GraphQLClient:
                 json=payload,
                 timeout=self.timeout,
                 verify=self.verify_tls,
+                stream=True,
             )
         except requests.exceptions.Timeout:
             return GraphQLResponse(
@@ -113,17 +157,38 @@ class GraphQLClient:
                 error=str(exc),
             )
 
+        try:
+            body, truncated = self._read_body(resp, start)
+        except requests.exceptions.Timeout:
+            return GraphQLResponse(
+                status_code=resp.status_code,
+                elapsed=time.perf_counter() - start,
+                timed_out=True,
+                error=f"response body did not finish within {self.timeout}s",
+            )
+        except requests.exceptions.RequestException as exc:
+            return GraphQLResponse(
+                status_code=resp.status_code,
+                elapsed=time.perf_counter() - start,
+                error=str(exc),
+            )
+        finally:
+            resp.close()
+
         elapsed = time.perf_counter() - start
+        text = body.decode(resp.encoding or "utf-8", errors="replace")
         parsed: dict[str, Any] | list[Any] | None
         try:
-            parsed = resp.json()
+            parsed = jsonlib.loads(text)
         except ValueError:
             parsed = None
         return GraphQLResponse(
             status_code=resp.status_code,
             elapsed=elapsed,
-            text=resp.text[:2000],
+            text=text[:2000],
             json=parsed,
+            truncated=truncated,
+            bytes_read=len(body),
         )
 
     def query(

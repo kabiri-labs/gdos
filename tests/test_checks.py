@@ -260,6 +260,53 @@ def test_auth_wall_is_inconclusive_not_protected():
     assert result.abort_scan is False
 
 
+def test_truncated_response_is_vulnerable():
+    """Hitting the read cap is evidence, not a parse failure.
+
+    A small probe that provoked more output than the scanner will hold is the
+    amplification the check exists to find. Without this the unparseable body
+    would fall through to INCONCLUSIVE.
+    """
+    resp = GraphQLResponse(
+        status_code=200, elapsed=2.0, text="x" * 2000, json=None,
+        truncated=True, bytes_read=10 * 1024 * 1024,
+    )
+    result = DeepIntrospectionCheck().run(FakeClient(resp), baseline=0.05)
+    assert result.verdict is Verdict.VULNERABLE
+    assert result.evidence["response_truncated"] is True
+    assert result.evidence["bytes_read"] == 10 * 1024 * 1024
+
+
+def test_truncated_batch_response_is_vulnerable():
+    resp = GraphQLResponse(
+        status_code=200, elapsed=2.0, json=None, truncated=True,
+        bytes_read=5 * 1024 * 1024,
+    )
+    result = BatchingCheck().run(FakeClient(resp), baseline=0.05)
+    assert result.verdict is Verdict.VULNERABLE
+    assert result.evidence["response_truncated"] is True
+
+
+def test_truncated_introspection_response_is_vulnerable():
+    resp = GraphQLResponse(
+        status_code=200, elapsed=2.0, json=None, truncated=True,
+        bytes_read=5 * 1024 * 1024,
+    )
+    result = IntrospectionEnabledCheck().run(FakeClient(resp), baseline=0.05)
+    assert result.verdict is Verdict.VULNERABLE
+
+
+def test_truncated_control_query_is_not_healthy():
+    """A control query asks for __typename; a huge answer is not normal."""
+    from gdos.checks.base import endpoint_healthy
+
+    resp = GraphQLResponse(
+        status_code=200, elapsed=1.0, json={"data": {"__typename": "Query"}},
+        truncated=True, bytes_read=10 * 1024 * 1024,
+    )
+    assert endpoint_healthy(resp) is False
+
+
 def test_error_on_transport_failure():
     resp = GraphQLResponse(status_code=None, elapsed=0.1, error="connection refused")
     result = AliasOverloadingCheck().run(FakeClient(resp), baseline=0.05)
