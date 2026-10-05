@@ -284,20 +284,77 @@ def test_endpoint_wide_throttling_is_inconclusive_and_aborts():
 
 # --- directives --------------------------------------------------------------
 
-def test_duplicate_directive_rejection_is_inconclusive():
-    """The spec's uniqueness rule firing says nothing about a count limit."""
-    resp = gql(
-        status=400,
-        json={"errors": [{"message": "The directive 'skip' can only be used once at this location."}]},
-    )
-    result = DirectiveOverloadingCheck().run(FakeClient(resp), baseline=0.05)
-    assert result.verdict is Verdict.INCONCLUSIVE
-    assert result.evidence["directive_count"] > 0
+_DUPLICATE_DIRECTIVE = gql(
+    status=400,
+    json={"errors": [{"message": "The directive 'skip' can only be used once at this location."}]},
+)
 
 
 def test_directive_executed_is_vulnerable():
     resp = gql(json={"data": {"__typename": "Query"}})
-    result = DirectiveOverloadingCheck().run(FakeClient(resp), baseline=0.05)
+    check = DirectiveOverloadingCheck()
+    client = FakeClient(resp)
+    result = check.run(client, baseline=0.05)
+    assert result.verdict is Verdict.VULNERABLE
+    assert result.evidence["directive_shape"] == "repeated-builtin"
+    # The first shape settled it, so no fallback probe was needed.
+    assert len(client.queries) == 1
+
+
+def test_duplicate_directive_rejection_falls_back_to_unknown_names():
+    """The uniqueness rule pre-empts the count limit, so try the other shape.
+
+    CVE-2022-37734 used thousands of *distinct non-existent* directives, which
+    the spec's uniqueness rule cannot refuse early. Without this fallback the
+    check reports nothing useful against any compliant validator.
+    """
+    executed = gql(json={"data": {"__typename": "Query"}})
+    client = FakeClient(_DUPLICATE_DIRECTIVE, executed)
+    result = DirectiveOverloadingCheck().run(client, baseline=0.05)
+
+    assert result.verdict is Verdict.VULNERABLE
+    assert result.evidence["directive_shape"] == "distinct-unknown"
+    assert result.evidence["repeated_shape_rejected_as_duplicate"] is True
+    assert len(client.queries) == 2
+    # The fallback must carry distinct names, or the uniqueness rule refuses
+    # it for the same reason the first probe was refused.
+    fallback = client.queries[1]
+    assert "@gdosDir0" in fallback and "@gdosDir1" in fallback
+    assert "@skip" not in fallback and "@include" not in fallback
+
+
+def test_unknown_directives_refused_slowly_are_vulnerable():
+    """CVE-2022-37734 is CPU burned during validation, before the rejection."""
+    slow_refusal = gql(
+        status=400,
+        json={"errors": [{"message": "Unknown directive 'gdosDir0'"}]},
+        elapsed=6.0,
+    )
+    client = FakeClient(_DUPLICATE_DIRECTIVE, slow_refusal, healthy(0.05))
+    result = DirectiveOverloadingCheck().run(client, baseline=0.05)
+    assert result.verdict is Verdict.VULNERABLE
+    assert "before the rejection" in result.summary or "work happens" in result.summary
+
+
+def test_unknown_directives_refused_quickly_are_protected():
+    fast_refusal = gql(
+        status=400, json={"errors": [{"message": "Unknown directive 'gdosDir0'"}]}
+    )
+    client = FakeClient(_DUPLICATE_DIRECTIVE, fast_refusal)
+    result = DirectiveOverloadingCheck().run(client, baseline=0.05)
+    assert result.verdict is Verdict.PROTECTED
+
+
+def test_slow_refusal_is_vulnerable_for_any_vector():
+    """A limit that costs 100x baseline to enforce is not much of a limit."""
+    slow_reject = gql(
+        status=400,
+        json={"errors": [{"message": "Query depth exceeds maximum"}]},
+        elapsed=8.0,
+    )
+    result = QueryDepthCheck().run(
+        FakeClient(slow_reject, healthy(0.05)), baseline=0.05
+    )
     assert result.verdict is Verdict.VULNERABLE
 
 
