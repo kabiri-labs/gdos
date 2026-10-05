@@ -1,9 +1,11 @@
 """Base types shared by every resilience check.
 
 A *check* probes a single GraphQL DoS vector with one bounded request and
-classifies the endpoint's behaviour. Checks are read-only with respect to the
-target: they never loop, never escalate automatically, and always honour the
-client timeout.
+classifies the endpoint's behaviour. A check may send a trivial control query
+to confirm an ambiguous result, and one check falls back to a second payload
+shape when the first cannot settle the question; neither is an escalation.
+Checks are read-only with respect to the target: they never loop, never raise
+the magnitude of a payload, and always honour the client timeout.
 
 Classification is deliberately conservative in both directions. A verdict of
 ``PROTECTED`` requires evidence that the payload was refused; a verdict of
@@ -416,6 +418,59 @@ class Check:
         if rejection is Rejection.RATE:
             return self._throttled(client, resp, baseline, vector_label)
 
+        # A refusal that was expensive to produce is still a resource finding.
+        # A parser or validator that burns CPU on the payload before saying no
+        # can be driven just as hard as one that executes it (CVE-2022-37734),
+        # so the slowdown check runs ahead of the verdict rather than only on
+        # the path where data came back.
+        if self._is_slow(resp.elapsed, baseline):
+            control = self._control(client)
+            if endpoint_healthy(control) and not self._is_slow(
+                control.elapsed, baseline
+            ):
+                # Absolute timings, not a ratio: against a sub-millisecond
+                # baseline a ratio reads as a meaningless four-digit number.
+                timing = (
+                    f"{resp.elapsed:.2f}s against a {baseline:.3f}s baseline"
+                )
+                if resp.ok and resp.has_data:
+                    summary = (
+                        f"Server accepted and processed the {vector_label} "
+                        f"payload, taking {timing}, while trivial queries stayed "
+                        "fast — no effective upfront limit."
+                    )
+                else:
+                    summary = (
+                        f"Server refused the {vector_label} payload but took "
+                        f"{timing} to do it, while trivial queries stayed fast — "
+                        "the work happens before the rejection, so the payload "
+                        "still consumes resources."
+                    )
+                return self._result(
+                    Verdict.VULNERABLE,
+                    summary,
+                    resp,
+                    baseline,
+                    evidence={
+                        "control_probe": "healthy",
+                        "control_elapsed_seconds": round(control.elapsed, 3),
+                        "rejection": rejection.value,
+                    },
+                )
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                f"The {vector_label} probe was slow, but a trivial control query "
+                "is slow too — the endpoint or network is degraded, so the "
+                "slowdown cannot be attributed to the payload.",
+                resp,
+                baseline,
+                evidence={
+                    "control_probe": "degraded",
+                    "control_elapsed_seconds": round(control.elapsed, 3),
+                },
+                severity=Severity.LOW,
+            )
+
         if rejection in (Rejection.LIMIT, Rejection.SIZE) and not resp.has_data:
             detail = (
                 "a protective limit/validation error"
@@ -441,37 +496,6 @@ class Check:
                     resp,
                     baseline,
                     evidence={"rejection": rejection.value},
-                    severity=Severity.LOW,
-                )
-            if self._is_slow(resp.elapsed, baseline):
-                control = self._control(client)
-                if endpoint_healthy(control) and not self._is_slow(
-                    control.elapsed, baseline
-                ):
-                    return self._result(
-                        Verdict.VULNERABLE,
-                        f"Server accepted and processed the {vector_label} payload "
-                        f"and was {resp.elapsed / max(baseline, 1e-3):.1f}x slower "
-                        "than baseline while trivial queries stayed fast — no "
-                        "effective upfront limit.",
-                        resp,
-                        baseline,
-                        evidence={
-                            "control_probe": "healthy",
-                            "control_elapsed_seconds": round(control.elapsed, 3),
-                        },
-                    )
-                return self._result(
-                    Verdict.INCONCLUSIVE,
-                    f"The {vector_label} probe was slow, but a trivial control "
-                    "query is slow too — the endpoint or network is degraded, so "
-                    "the slowdown cannot be attributed to the payload.",
-                    resp,
-                    baseline,
-                    evidence={
-                        "control_probe": "degraded",
-                        "control_elapsed_seconds": round(control.elapsed, 3),
-                    },
                     severity=Severity.LOW,
                 )
             return self._result(

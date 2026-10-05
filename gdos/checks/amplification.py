@@ -90,9 +90,21 @@ class FieldDuplicationCheck(Check):
 class DirectiveOverloadingCheck(Check):
     """A field annotated with a huge number of directives.
 
-    Repeating built-in directives (``@include`` / ``@skip``) thousands of times
-    forces the validator/parser to do work proportional to the directive count
-    (CVE-2024-47614). A token/complexity limit stops this.
+    Two documented shapes of this attack exist, and a server can be resilient
+    to one and not the other:
+
+    * **Repeated built-in directive** — ``@include`` / ``@skip`` stacked on one
+      field thousands of times, which exhausts the parser/validator
+      (CVE-2024-47614, async-graphql before 7.0.10).
+    * **Distinct unknown directives** — thousands of *different* made-up
+      directive names, which is the shape behind CVE-2022-37734 (graphql-java
+      before 17.4/18.3/19.0).
+
+    The first shape is pre-empted on any spec-compliant server by the
+    "Directives Are Unique Per Location" rule, which refuses the document
+    before a directive-count limit is ever consulted. The second shape carries
+    no repeats, so that rule cannot fire and the validator has to work through
+    every directive — which is exactly why it is used as the second probe.
     """
 
     name = "directive-overloading"
@@ -103,33 +115,39 @@ class DirectiveOverloadingCheck(Check):
         "token/length limit before validation."
     )
 
-    def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
-        count = self._scaled(low=200, medium=1000, high=5000)
+    def _build_repeated(self, count: int) -> str:
         directives = " ".join(
             "@skip(if: false)" if i % 2 else "@include(if: true)"
             for i in range(count)
         )
-        resp = client.query("query GdosDirectiveProbe { __typename %s }" % directives)
+        return "query GdosDirectiveProbe { __typename %s }" % directives
 
-        # ``@skip``/``@include`` are not repeatable, so a spec-compliant
-        # validator refuses this document on the uniqueness rule alone. That
-        # rejection happens regardless of any directive-count limit, so it
-        # neither proves nor disproves resilience to this vector.
-        if rejected_as_duplicate_directive(resp):
-            result = self._result(
-                Verdict.INCONCLUSIVE,
-                "Server rejected the document under the spec's unique-directive "
-                "rule before any directive-count limit could apply, so this "
-                "vector could not be isolated. The parser still had to read all "
-                f"{count} directives; verify a query token/length limit exists.",
-                resp,
-                baseline,
-                severity=Severity.LOW,
-            )
-        else:
+    def _build_unknown(self, count: int) -> str:
+        directives = " ".join("@gdosDir%d" % i for i in range(count))
+        return "query GdosDirectiveProbeB { __typename %s }" % directives
+
+    def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
+        count = self._scaled(low=200, medium=1000, high=5000)
+        resp = client.query(self._build_repeated(count))
+
+        if not rejected_as_duplicate_directive(resp):
             result = self._classify_amplification(
                 client, resp, baseline, "directive overloading"
             )
+            result.evidence["directive_shape"] = "repeated-builtin"
+            result.evidence["directive_count"] = count
+            return result
+
+        # The uniqueness rule refused the document before any directive-count
+        # limit could apply, so that probe settled nothing. Fall back to the
+        # shape that rule cannot pre-empt. This is the one case where a vector
+        # costs a second request, and it is still a single bounded probe.
+        resp = client.query(self._build_unknown(count))
+        result = self._classify_amplification(
+            client, resp, baseline, "directive overloading (distinct unknown names)"
+        )
+        result.evidence["directive_shape"] = "distinct-unknown"
+        result.evidence["repeated_shape_rejected_as_duplicate"] = True
         result.evidence["directive_count"] = count
         return result
 

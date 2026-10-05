@@ -6,10 +6,11 @@ production deployment needs. Its purpose is *defensive*: to give security
 engineers and developers confidence that their GraphQL API **cannot** be
 trivially knocked over by a single malicious query.
 
-Unlike a flooding tool, GDoS sends **bounded, single-shot probes** — one
-crafted request per attack vector — and classifies the server's response as
-`PROTECTED`, `VULNERABLE`, `INCONCLUSIVE`, or `ERROR`. It never loops, never
-escalates automatically, and always honours a hard per-request timeout.
+Unlike a flooding tool, GDoS sends **bounded, single-shot probes** — normally
+one crafted request per attack vector, plus a trivial control query when a
+result needs confirming — and classifies the server's response as `PROTECTED`,
+`VULNERABLE`, `INCONCLUSIVE`, or `ERROR`. It never loops, never raises the
+magnitude of a payload, and always honours a hard per-request timeout.
 
 > ⚠️ **Authorized use only.** GDoS sends deliberately abusive (but bounded)
 > payloads. Only run it against endpoints you own or are explicitly authorized
@@ -24,7 +25,7 @@ escalates automatically, and always honours a hard per-request timeout.
 | **Recursive introspection** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
 | **Alias-based amplification** | Hundreds/thousands of aliases of one field | Enforce an alias-count / node limit |
 | **Field duplication** | The same field repeated many times | Count duplicates in a complexity budget |
-| **Directive overloading** | A field annotated with thousands of directives | Limit directives / query token length |
+| **Directive overloading** | A field annotated with thousands of directives, in both documented shapes | Limit directives / query token length |
 | **Array request batching** | A JSON array of many operations in one request | Cap or disable batch size |
 | **Circular fragment spread** | A self-referential fragment (spec-forbidden) | Reject during validation |
 
@@ -47,9 +48,18 @@ shipped, and patched, several of them:
 | [CVE-2023-26144](https://osv.dev/vulnerability/CVE-2023-26144) | `graphql` (npm) | 16.8.1 | `OverlappingFieldsCanBeMergedRule` lacks guards on large queries |
 
 Mapped onto the checks above: deep nesting covers CVE-2023-28867 and
-RUSTSEC-2022-0037, recursive introspection covers CVE-2024-40094, directive
-overloading covers CVE-2022-37734 and CVE-2024-47614, and field duplication
-covers CVE-2023-26144.
+RUSTSEC-2022-0037, recursive introspection covers CVE-2024-40094, and field
+duplication covers CVE-2023-26144.
+
+Directive overloading covers both of its CVEs, because they are 2 different
+payload shapes and a server can be resilient to one and not the other.
+CVE-2024-47614 is one *non-repeatable* directive stacked on a field thousands
+of times; CVE-2022-37734 is thousands of *distinct non-existent* directive
+names. The first shape is refused early by any spec-compliant validator under
+the "Directives Are Unique Per Location" rule — before a directive-count limit
+is ever consulted — so when GDoS sees that rule fire it re-probes with the
+second shape, which carries no repeats and therefore cannot be dismissed the
+same way. This is the only vector that may cost a second request.
 
 The remaining 4 vectors carry no canonical library CVE, for 2 different
 reasons. **Alias-based amplification**, **array request batching** and **schema
@@ -75,6 +85,10 @@ for all 8 vectors directly instead of fingerprinting versions.
    - The payload was **executed** — data came back, or the server returned
      `5xx`, timed out, or answered far slower than baseline → **VULNERABLE**.
      The last 3 are confirmed against a control query first (see below).
+   - The payload was **refused, but slowly** → **VULNERABLE**. A parser or
+     validator that burns CPU working through the payload before rejecting it
+     can be driven just as hard as one that executes it; that is precisely
+     CVE-2022-37734.
    - The endpoint never exercised its DoS controls — an authentication wall, a
      throttle, a degraded or unreachable endpoint, an unexpected shape →
      **INCONCLUSIVE**.
