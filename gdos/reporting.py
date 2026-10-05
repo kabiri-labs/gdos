@@ -29,7 +29,12 @@ def to_json(report: ScanReport) -> str:
         "started_at": report.started_at,
         "finished_at": report.finished_at,
         "baseline_seconds": round(report.baseline_seconds, 4),
+        "baseline_ok": report.baseline_ok,
+        "baseline_samples_ok": report.baseline_samples_ok,
         "is_vulnerable": report.is_vulnerable,
+        "is_conclusive": report.is_conclusive,
+        "aborted": report.aborted,
+        "abort_reason": report.abort_reason,
         "counts": report.counts(),
         "results": [
             {
@@ -65,7 +70,13 @@ def to_text(report: ScanReport, color: bool = True) -> str:
     lines.append("=" * 72)
     lines.append(f"Target    : {report.url}")
     lines.append(f"Started   : {report.started_at}")
-    lines.append(f"Baseline  : {report.baseline_seconds:.3f}s")
+    if report.baseline_ok:
+        lines.append(
+            f"Baseline  : {report.baseline_seconds:.3f}s "
+            f"({report.baseline_samples_ok} healthy sample(s))"
+        )
+    else:
+        lines.append(_color("Baseline  : FAILED — endpoint not scannable", "31", color))
     lines.append("")
 
     ordered = sorted(
@@ -83,6 +94,11 @@ def to_text(report: ScanReport, color: bool = True) -> str:
             lines.append(f"       fix: {r.remediation}")
         lines.append("")
 
+    if report.aborted and report.abort_reason:
+        lines.append(_color("Scan aborted early:", "33;1", color))
+        lines.append(f"  {report.abort_reason}")
+        lines.append("")
+
     counts = report.counts()
     summary = (
         f"{counts[Verdict.VULNERABLE.value]} vulnerable, "
@@ -93,6 +109,16 @@ def to_text(report: ScanReport, color: bool = True) -> str:
     lines.append("-" * 72)
     if report.is_vulnerable:
         lines.append(_color(f"RESULT: VULNERABLE — {summary}", "31;1", color))
+    elif not report.is_conclusive:
+        # Never report an unexercised endpoint as clean: no check reached a
+        # conclusive verdict, so this says nothing about the target's defences.
+        lines.append(
+            _color(f"RESULT: INCONCLUSIVE — {summary}", "33;1", color)
+        )
+        lines.append(
+            "        No check produced a conclusive verdict; this is NOT a "
+            "clean result."
+        )
     else:
         lines.append(_color(f"RESULT: no DoS exposure detected — {summary}", "32;1", color))
     lines.append("=" * 72)

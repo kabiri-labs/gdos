@@ -5,9 +5,11 @@ from __future__ import annotations
 from gdos.checks.base import (
     Check,
     CheckResult,
+    Rejection,
     Severity,
     Verdict,
-    response_indicates_limit,
+    classify_rejection,
+    endpoint_healthy,
 )
 from gdos.client import GraphQLClient
 
@@ -41,9 +43,31 @@ class IntrospectionEnabledCheck(Check):
 
     def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
         resp = client.query(_MINIMAL_INTROSPECTION)
-        schema = None
-        if isinstance(resp.json, dict):
-            schema = (resp.json.get("data") or {}).get("__schema")
+
+        if resp.error and not resp.timed_out:
+            return self._result(
+                Verdict.ERROR,
+                f"Probe could not be delivered: {resp.error}",
+                resp,
+                baseline,
+                severity=Severity.INFO,
+            )
+        if resp.timed_out:
+            if endpoint_healthy(self._control(client)):
+                return self._result(
+                    Verdict.INCONCLUSIVE,
+                    "The introspection probe timed out while trivial queries "
+                    "still succeed. Introspection state is unknown, but a schema "
+                    "that cannot be listed inside the timeout is itself an "
+                    "expensive operation to expose.",
+                    resp,
+                    baseline,
+                    evidence={"control_probe": "healthy"},
+                    severity=Severity.LOW,
+                )
+            return self._unreachable(resp, baseline, "The introspection probe timed out")
+
+        schema = (resp.data or {}).get("__schema")
         if schema:
             type_count = len(schema.get("types") or [])
             return self._result(
@@ -55,12 +79,29 @@ class IntrospectionEnabledCheck(Check):
                 baseline,
                 evidence={"types_exposed": type_count},
             )
-        if response_indicates_limit(resp) or resp.graphql_errors:
+
+        rejection = classify_rejection(resp)
+        if rejection is Rejection.AUTH:
+            return self._auth_wall(resp, baseline, "introspection")
+        if rejection is Rejection.RATE:
+            control = self._control(client)
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                "Endpoint throttled the introspection probe, so its introspection "
+                "state could not be determined.",
+                resp,
+                baseline,
+                evidence={"rejection": rejection.value},
+                severity=Severity.LOW,
+                abort_scan=not endpoint_healthy(control),
+            )
+        if rejection in (Rejection.LIMIT, Rejection.SIZE, Rejection.VALIDATION):
             return self._result(
                 Verdict.PROTECTED,
                 "Introspection appears to be disabled or restricted.",
                 resp,
                 baseline,
+                evidence={"rejection": rejection.value},
                 severity=Severity.INFO,
             )
         return self._result(
@@ -77,7 +118,7 @@ class DeepIntrospectionCheck(Check):
 
     Even when introspection is enabled, a server should bound query depth /
     complexity so a recursive introspection query cannot be used as an
-    amplification primitive.
+    amplification primitive (CVE-2024-40094).
     """
 
     name = "deep-introspection"
@@ -100,6 +141,8 @@ class DeepIntrospectionCheck(Check):
     def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
         depth = self._scaled(low=4, medium=8, high=12)
         resp = client.query(self._build(depth))
-        result = self._classify_amplification(resp, baseline, "deep introspection")
+        result = self._classify_amplification(
+            client, resp, baseline, "deep introspection"
+        )
         result.evidence["nesting_depth"] = depth
         return result

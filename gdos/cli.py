@@ -9,7 +9,7 @@ import sys
 from gdos import __version__
 from gdos.client import GraphQLClient
 from gdos.reporting import to_json, to_text
-from gdos.scanner import Scanner
+from gdos.scanner import ScanReport, Scanner
 
 log = logging.getLogger("gdos")
 
@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of warm-up requests used to compute the baseline (default: 3)",
     )
     parser.add_argument(
+        "--delay", type=float, default=0.5,
+        help="seconds to wait between checks, to avoid tripping the target's "
+             "rate limiter mid-scan (default: 0.5)",
+    )
+    parser.add_argument(
         "--insecure", action="store_true",
         help="disable TLS certificate verification (not recommended)",
     )
@@ -95,6 +100,20 @@ def _confirm_authorization(url: str, assume_yes: bool) -> bool:
     return answer in ("y", "yes")
 
 
+def exit_code(report: ScanReport) -> int:
+    """Map a finished scan onto the documented process exit codes.
+
+    ``1`` when something is vulnerable, ``4`` when the scan proved nothing
+    either way, ``0`` only for a scan that actually exercised the endpoint and
+    found it hardened.
+    """
+    if report.is_vulnerable:
+        return 1
+    if not report.is_conclusive:
+        return 4
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -125,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             client,
             intensity=args.intensity,
             baseline_samples=args.baseline_samples,
+            delay=args.delay,
         )
         report = scanner.run()
     finally:
@@ -135,9 +155,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(to_text(report, color=not args.no_color))
 
-    # Exit non-zero when at least one vulnerability was found, so the scanner can
-    # gate CI / be used in automated pipelines.
-    return 1 if report.is_vulnerable else 0
+    # Exit non-zero when at least one vulnerability was found, so the scanner
+    # can gate CI / be used in automated pipelines.
+    return exit_code(report)
 
 
 if __name__ == "__main__":

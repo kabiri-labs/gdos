@@ -13,7 +13,7 @@ from gdos.checks.amplification import (
     FieldDuplicationCheck,
     QueryDepthCheck,
 )
-from gdos.checks.base import Check, CheckResult, Severity, Verdict
+from gdos.checks.base import Check, CheckResult, Rejection, Severity, Verdict
 from gdos.checks.batching import BatchingCheck, CircularFragmentCheck
 from gdos.checks.introspection import (
     DeepIntrospectionCheck,
@@ -35,6 +35,7 @@ __all__ = [
     "ALL_CHECKS",
     "Check",
     "CheckResult",
+    "Rejection",
     "Severity",
     "Verdict",
     "AliasOverloadingCheck",

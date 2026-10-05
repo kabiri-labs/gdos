@@ -42,6 +42,15 @@ class GraphQLResponse:
         return []
 
     @property
+    def data(self) -> dict[str, Any] | None:
+        """The ``data`` object from a GraphQL response body, if any."""
+        if isinstance(self.json, dict):
+            payload = self.json.get("data")
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    @property
     def has_data(self) -> bool:
         return isinstance(self.json, dict) and self.json.get("data") not in (None, {})
 
@@ -70,7 +79,7 @@ class GraphQLClient:
         default_headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "gdos-scanner/2.0 (+graphql-dos-resilience-scanner)",
+            "User-Agent": "gdos-scanner/2.1 (+graphql-dos-resilience-scanner)",
         }
         if headers:
             default_headers.update(headers)
