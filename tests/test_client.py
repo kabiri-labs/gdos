@@ -59,6 +59,35 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
             return
 
+        if mode == "exact":
+            body = _BEHAVIOUR["body"]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if mode == "trickle_content_length":
+            # Declares a length and then dribbles pieces far smaller than the
+            # client's read chunk, so the read blocks mid-chunk instead of
+            # yielding. This is the shape that defeated an in-loop deadline.
+            total = int(_BEHAVIOUR.get("total", 1_000_000))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(total))
+            self.end_headers()
+            try:
+                sent = 0
+                while sent < total:
+                    self.wfile.write(b"." * 100)
+                    self.wfile.flush()
+                    sent += 100
+                    time.sleep(0.2)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+
         if mode == "trickle":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -132,6 +161,60 @@ def test_trickled_response_hits_the_deadline(server):
 
     assert resp.timed_out is True
     assert elapsed < 10, "the client kept reading well past its own timeout"
+
+
+def test_trickled_content_length_response_hits_the_deadline(server):
+    """Regression: the deadline must interrupt a blocked read, not just follow it.
+
+    With `Content-Length` set, the socket read blocks until the full chunk is
+    available, so a server dribbling pieces smaller than the read chunk never
+    lets an in-loop clock check run. Each arriving byte also resets the
+    per-read socket timeout, so the scanner was held open indefinitely — this
+    case ran past 60s against a 1s timeout before the watchdog was added. The
+    chunked test above passed throughout, which is why the gap was missed.
+    """
+    _BEHAVIOUR.update(mode="trickle_content_length", total=1_000_000)
+    with GraphQLClient(server, timeout=1.0, max_response_bytes=10 * 1024 * 1024) as c:
+        start = time.perf_counter()
+        resp = c.query("query GdosDepthProbe { __typename }")
+        elapsed = time.perf_counter() - start
+
+    assert resp.timed_out is True
+    assert elapsed < 10, f"the client held on for {elapsed:.1f}s despite a 1s timeout"
+
+
+def test_body_exactly_at_the_cap_is_not_truncated(server):
+    """Regression: a complete body the size of the cap is not an amplification.
+
+    `truncated` drives a VULNERABLE verdict, so flagging it without having
+    seen a single byte beyond the cap invents a finding — and the body here
+    parses perfectly well.
+    """
+    cap = 200_000
+    pad = cap - len('{"data":{"__typename":"Query","pad":""}}')
+    body = ('{"data":{"__typename":"Query","pad":"%s"}}' % ("x" * pad)).encode()
+    body = body[:cap]
+    assert len(body) == cap
+    _BEHAVIOUR.update(mode="exact", body=body)
+
+    with GraphQLClient(server, timeout=10, max_response_bytes=cap) as client:
+        resp = client.query("query GdosDeepIntrospection { __typename }")
+
+    assert resp.bytes_read == cap
+    assert resp.truncated is False
+    assert resp.has_data, "the whole body arrived and should have parsed"
+
+
+def test_one_byte_over_the_cap_is_truncated(server):
+    """The boundary in the other direction: cap + 1 byte really is truncated."""
+    cap = 200_000
+    _BEHAVIOUR.update(mode="exact", body=b"x" * (cap + 1))
+
+    with GraphQLClient(server, timeout=10, max_response_bytes=cap) as client:
+        resp = client.query("query GdosDeepIntrospection { __typename }")
+
+    assert resp.truncated is True
+    assert resp.bytes_read == cap
 
 
 def test_default_cap_is_applied():
