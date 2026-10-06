@@ -1,6 +1,6 @@
 # GDoS — GraphQL DoS Resilience Scanner
 
-[![Release](https://img.shields.io/github/v/release/kabiri-labs/gdos)](https://github.com/kabiri-labs/gdos/releases/latest)
+[![Version](https://img.shields.io/github/v/tag/kabiri-labs/gdos)](https://github.com/kabiri-labs/gdos/releases)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
