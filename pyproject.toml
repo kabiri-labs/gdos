@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gdos"
-version = "2.2.0"
+version = "2.3.0"
 description = "GraphQL DoS resilience scanner — verify a GraphQL endpoint is hardened against DoS amplification attacks."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -10,7 +10,9 @@ Unlike a flooding tool, GDoS sends **bounded, single-shot probes** — normally
 one crafted request per attack vector, plus a trivial control query when a
 result needs confirming — and classifies the server's response as `PROTECTED`,
 `VULNERABLE`, `INCONCLUSIVE`, or `ERROR`. It never loops, never raises the
-magnitude of a payload, and always honours a hard per-request timeout.
+magnitude of a payload, and always honours a hard per-request timeout. Every
+probe is read-only with respect to the target unless you opt in to the one
+exception, described below.
 
 > ⚠️ **Authorized use only.** GDoS sends deliberately abusive (but bounded)
 > payloads. Only run it against endpoints you own or are explicitly authorized
@@ -21,17 +23,29 @@ magnitude of a payload, and always honours a hard per-request timeout.
 | Vector | What it tests | A hardened server should… |
 | --- | --- | --- |
 | **Schema introspection exposure** | Whether the full schema is readable | Disable introspection in production |
+| **Field suggestion leakage** | Whether errors volunteer real field names | Mask suggestions in production errors |
+| **Automatic Persisted Queries** | Whether clients can register documents at runtime | Bound the APQ cache, or disable APQ |
+| **Query execution over GET** | Whether queries run outside POST | Accept POST only, or cover GET identically |
 | **Query depth (deep nesting)** | Deeply nested selection sets | Reject queries past a max depth |
 | **Recursive introspection** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
 | **Alias-based amplification** | Hundreds/thousands of aliases of one field | Enforce an alias-count / node limit |
 | **Field duplication** | The same field repeated many times | Count duplicates in a complexity budget |
 | **Directive overloading** | A field annotated with thousands of directives, in both documented shapes | Limit directives / query token length |
+| **Incremental delivery overload** | Many `@defer` fragments in one document | Cap `@defer`/`@stream` per document |
 | **Array request batching** | A JSON array of many operations in one request | Cap or disable batch size |
 | **Circular fragment spread** | A self-referential fragment (spec-forbidden) | Reject during validation |
 
 The probes rely only on the universal GraphQL meta-fields (`__typename`,
 `__type`, `__schema`), so they work against **any** spec-compliant endpoint
 without prior knowledge of its schema.
+
+Of the 12, **8 are amplification vectors** — one small request, a
+disproportionate amount of work. The other 4 do not amplify anything by
+themselves; they cover the surface that makes amplification practical. A
+transport the deployment's limits do not reach, a cache clients can fill, and
+error messages that hand over the schema needed to aim a complexity attack are
+all part of whether an endpoint can be knocked over, so GDoS reports them
+alongside the payloads rather than leaving them to a separate tool.
 
 ### Related CVEs
 
@@ -61,17 +75,32 @@ is ever consulted — so when GDoS sees that rule fire it re-probes with the
 second shape, which carries no repeats and therefore cannot be dismissed the
 same way. This is the only vector that may cost a second request.
 
-The remaining 4 vectors carry no canonical library CVE, for 2 different
-reasons. **Alias-based amplification**, **array request batching** and **schema
-introspection exposure** are not implementation bugs at all — they are
-defaults. A server that permits unlimited aliases, accepts unbounded batches or
-serves its full schema is behaving exactly as written. **Circular fragment
-spread** is the opposite case: rejecting it is mandatory under the GraphQL
-spec, so a server that executes one has a broken validation phase rather than a
-catalogued vulnerability.
+2 further vectors have a published advisory but no CVE identifier:
+
+- **Automatic Persisted Queries.** Apollo Server enabled APQ by default backed
+  by an *unbounded* cache, so a client could register documents until the
+  server ran out of memory. It was handled as documented hardening rather than
+  a CVE: Apollo Server 3.9 added
+  [`cache: "bounded"`](https://www.apollographql.com/docs/apollo-server/v3/performance/cache-backends),
+  and `persistedQueries: false` turns the feature off.
+- **Incremental delivery.** The
+  [defer/stream RFC](https://github.com/graphql/graphql-wg/blob/main/rfcs/DeferStream.md)
+  names an unbounded number of `@defer` directives as an open denial-of-service
+  question. Servers that do not implement the directives must fail such
+  documents in validation.
+
+The remaining 6 carry no advisory at all, for 2 different reasons. **Alias-based
+amplification**, **array request batching**, **schema introspection exposure**,
+**field suggestion leakage** and **query execution over GET** are not
+implementation bugs — they are defaults and deployment choices. A server that
+permits unlimited aliases, accepts unbounded batches, serves its full schema,
+suggests field names or answers queries over GET is behaving exactly as
+written. **Circular fragment spread** is the opposite case: rejecting it is
+mandatory under the GraphQL spec, so a server that executes one has a broken
+validation phase rather than a catalogued vulnerability.
 
 Either way, patching a dependency does not close them, which is why GDoS probes
-for all 8 vectors directly instead of fingerprinting versions.
+for all 12 vectors directly instead of fingerprinting versions.
 
 ## How a verdict is reached
 
@@ -119,6 +148,24 @@ verdicts that merely reflect a tripped rate limiter or a downed host, and it
 stops GDoS from continuing to probe an endpoint that is already unwell. An
 aborted scan is always inconclusive, even if the checks that ran before it
 came back `PROTECTED`, because the vectors after the abort were never probed.
+
+### Every probe is read-only, with one opt-in exception
+
+GDoS does not change anything on the target. The single exception is the
+persisted-query check, and it is off unless you ask for it.
+
+Detecting whether Automatic Persisted Queries are enabled is read-only: an
+unknown hash comes back as a cache miss. Whether that cache is *bounded* cannot
+be read from one request, and filling it to find out would be flooding someone
+else's server. What one request can establish is whether the server verifies
+that a hash belongs to the document it is given — a server that does not lets
+an attacker choose both the cache key and its contents, which is what makes
+both unbounded growth and cache poisoning trivial.
+
+Testing that writes exactly one entry to the target's cache, so it needs
+`--apq-register`. Without the flag the check reports `INCONCLUSIVE` and tells
+you what it did not do; with it, the report records the hash and document that
+were submitted. Nothing else in the tool writes to a target.
 
 ### Bounded reads
 
@@ -184,6 +231,8 @@ options:
   --baseline-samples N    warm-up requests for the baseline (default: 3)
   --max-response-bytes N  stop reading a response body after N bytes
                           (default: 10485760)
+  --apq-register          allow the persisted-query check to write one entry
+                          to the target's APQ cache (off by default)
   --delay SECONDS         pause between checks, so the scan does not trip the
                           target's rate limiter (default: 0.5)
   --insecure              disable TLS verification (not recommended)
@@ -229,16 +278,21 @@ never happened.
 
 ```
 gdos/
-  client.py        # bounded, timeout-aware GraphQL HTTP client
+  client.py        # bounded, timeout-aware GraphQL HTTP client (POST + GET)
   scanner.py       # baseline measurement + check orchestration
   reporting.py     # text / JSON report rendering
   cli.py           # argparse command-line interface
-  checks/          # one module per attack vector
+  checks/          # one module per vector family
     base.py        # Check base class + verdict classification
     introspection.py
     amplification.py
     batching.py
-tests/             # unit tests for the classification logic (no network needed)
+    persisted.py   # Automatic Persisted Queries
+    transport.py   # GET execution, @defer, field suggestions
+tests/
+  test_checks.py   # classification logic, stub-driven, no sockets
+  test_surface_vectors.py
+  test_client.py   # read cap + transfer deadline, loopback server
 ```
 
 ## Development

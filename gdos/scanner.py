@@ -79,12 +79,14 @@ class Scanner:
         checks: tuple[type[Check], ...] = ALL_CHECKS,
         baseline_samples: int = 3,
         delay: float = 0.5,
+        allow_state_changing: bool = False,
     ) -> None:
         self.client = client
         self.intensity = intensity
         self.checks = checks
         self.baseline_samples = max(1, baseline_samples)
         self.delay = max(0.0, delay)
+        self.allow_state_changing = allow_state_changing
 
     def _measure_baseline(self) -> tuple[float, int]:
         """Median round-trip of a trivial query, used to detect slow probes.
@@ -176,7 +178,10 @@ class Scanner:
             if index and self.delay:
                 time.sleep(self.delay)
 
-            check = check_cls(intensity=self.intensity)
+            check = check_cls(
+                intensity=self.intensity,
+                allow_state_changing=self.allow_state_changing,
+            )
             log.info("Running check: %s", check.name)
             try:
                 result = check.run(self.client, baseline)

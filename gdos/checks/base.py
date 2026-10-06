@@ -245,11 +245,20 @@ class Check:
     severity: Severity = Severity.MEDIUM
     remediation: str = ""
 
-    def __init__(self, intensity: str = "medium", slow_factor: float = 3.0) -> None:
+    def __init__(
+        self,
+        intensity: str = "medium",
+        slow_factor: float = 3.0,
+        allow_state_changing: bool = False,
+    ) -> None:
         self.intensity = intensity
         # A probe is considered to have a "resource impact" if it takes
         # ``slow_factor`` times the baseline (plus a small floor).
         self.slow_factor = slow_factor
+        # Deny by default. Every probe is read-only with respect to the target
+        # unless the operator opts in, and a check that would write must check
+        # this flag rather than assume consent.
+        self.allow_state_changing = allow_state_changing
 
     def run(self, client: "GraphQLClient", baseline: float) -> CheckResult:
         raise NotImplementedError

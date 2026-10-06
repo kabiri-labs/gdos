@@ -63,6 +63,10 @@ class FakeClient:
         self.payloads.append(payload)
         return self._next()
 
+    def get(self, query: str, variables=None) -> GraphQLResponse:
+        self.queries.append(query)
+        return self._next()
+
 
 def gql(json=None, status=200, elapsed=0.05, **kw) -> GraphQLResponse:
     return GraphQLResponse(status_code=status, elapsed=elapsed, json=json, **kw)
@@ -566,6 +570,32 @@ class ScriptedClient:
     def post(self, payload) -> GraphQLResponse:
         return self._probe
 
+    def get(self, query: str, variables=None) -> GraphQLResponse:
+        return self._probe
+
+
+def test_every_check_has_a_transport_on_the_stubs():
+    """Guard: a stub missing a transport turns a real verdict into ERROR.
+
+    `GetMethodCheck` reaches for `client.get`, and the scanner's per-check
+    guard would quietly convert the resulting AttributeError into an ERROR
+    verdict — silently dropping that check from every scanner test.
+    """
+    for stub in (FakeClient(healthy()), ScriptedClient(healthy(), healthy())):
+        for transport in ("query", "post", "get"):
+            assert callable(getattr(stub, transport, None)), (
+                f"{type(stub).__name__} is missing {transport}()"
+            )
+
+
+def test_scanner_runs_every_registered_check():
+    client = ScriptedClient(baseline=healthy(), probe=healthy())
+    report = Scanner(client, baseline_samples=1, delay=0).run()
+    assert len(report.results) == len(ALL_CHECKS)
+    assert [r.name for r in report.results] == [c.name for c in ALL_CHECKS]
+    # No check may fall over on a stub that answers everything.
+    assert not [r for r in report.results if r.verdict is Verdict.ERROR]
+
 
 def test_failed_baseline_marks_every_check_error():
     client = ScriptedClient(baseline=timed_out(), probe=healthy())
@@ -592,6 +622,9 @@ def test_failed_baseline_samples_are_excluded_from_the_median():
             return timed_out() if self.calls == 1 else healthy(0.10)
 
         def post(self, payload) -> GraphQLResponse:
+            return healthy(0.10)
+
+        def get(self, query: str, variables=None) -> GraphQLResponse:
             return healthy(0.10)
 
     scanner = Scanner(FlakyBaseline(), baseline_samples=3, delay=0)
@@ -634,6 +667,9 @@ class PhasedClient:
     def post(self, payload) -> GraphQLResponse:
         return timed_out()
 
+    def get(self, query: str, variables=None) -> GraphQLResponse:
+        return timed_out()
+
 
 def test_aborted_scan_is_never_conclusive_even_with_a_protected_check():
     """Regression: a partial scan must not produce a clean CI result.
@@ -666,6 +702,9 @@ def test_abort_after_a_vulnerability_still_exits_one():
             return timed_out()
 
         def post(self, payload) -> GraphQLResponse:
+            return timed_out()
+
+        def get(self, query: str, variables=None) -> GraphQLResponse:
             return timed_out()
 
     report = Scanner(VulnerableThenDead(), baseline_samples=1, delay=0).run()
