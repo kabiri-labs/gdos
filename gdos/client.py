@@ -15,6 +15,8 @@ error — it is evidence, and the checks treat it as such.
 from __future__ import annotations
 
 import json as jsonlib
+import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +28,38 @@ DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 enough that a runaway amplification cannot exhaust the scanner."""
 
 _READ_CHUNK = 64 * 1024
+
+
+def _force_disconnect(resp: "requests.Response") -> None:
+    """Break a connection hard enough to interrupt a blocked read.
+
+    ``Response.close()`` only releases the connection back to the pool, so a
+    thread sitting in ``recv`` keeps waiting on it. Shutting the socket down is
+    what actually wakes that thread, which is the whole point of the deadline
+    watchdog. The attribute paths differ between urllib3 versions, so every
+    step is attempted and none is required to succeed.
+    """
+    raw = getattr(resp, "raw", None)
+    candidates = []
+    for attr in ("_connection", "connection"):
+        candidates.append(getattr(getattr(raw, attr, None), "sock", None))
+    fp = getattr(getattr(raw, "_fp", None), "fp", None)
+    candidates.append(getattr(getattr(fp, "raw", None), "_sock", None))
+    candidates.append(getattr(fp, "_sock", None))
+    for sock in candidates:
+        if sock is None:
+            continue
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    for closer in (getattr(raw, "close", None), getattr(resp, "close", None)):
+        if closer is None:
+            continue
+        try:
+            closer()
+        except Exception:  # noqa: BLE001 - nothing useful to do on the way out
+            pass
 
 
 @dataclass
@@ -109,24 +143,57 @@ class GraphQLClient:
         """Read at most ``max_response_bytes``, and never past the deadline.
 
         Returns the bytes read and whether the cap stopped the read. The
-        deadline matters as much as the cap: ``timeout`` governs the wait
-        between chunks, not the transfer as a whole, so a server trickling
+        deadline matters as much as the cap: ``timeout`` governs the wait for
+        each socket read, not the transfer as a whole, so a server trickling
         bytes indefinitely would otherwise hold the scanner open forever.
+
+        Checking the clock between chunks is not enough to enforce that. On a
+        response carrying ``Content-Length`` the read blocks until the chunk is
+        *full*, so a server dribbling pieces smaller than ``_READ_CHUNK`` never
+        yields and the check never runs. The deadline therefore also arms a
+        watchdog that closes the response out from under the blocked read,
+        which is what makes the bound hold regardless of transfer encoding.
         """
+        deadline = start + self.timeout
+        expired = threading.Event()
+
+        def give_up() -> None:
+            expired.set()
+            _force_disconnect(resp)
+
+        watchdog = threading.Timer(max(0.0, deadline - time.perf_counter()), give_up)
+        watchdog.daemon = True
+        watchdog.start()
+
         chunks: list[bytes] = []
         total = 0
-        for chunk in resp.iter_content(chunk_size=_READ_CHUNK):
-            if time.perf_counter() - start > self.timeout:
+        try:
+            for chunk in resp.iter_content(chunk_size=_READ_CHUNK):
+                if expired.is_set() or time.perf_counter() > deadline:
+                    raise requests.exceptions.Timeout(
+                        "response body still arriving after the timeout"
+                    )
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                # Strictly greater: a body that is exactly the cap was read in
+                # full, and calling that truncated would report an amplified
+                # response where there was none.
+                if total > self.max_response_bytes:
+                    return b"".join(chunks)[: self.max_response_bytes], True
+            return b"".join(chunks), False
+        except Exception as exc:
+            # The watchdog closes the socket mid-read, which surfaces as
+            # whatever the stack beneath requests happens to raise. If the
+            # deadline is what stopped us, report it as the timeout it is.
+            if expired.is_set() or time.perf_counter() > deadline:
                 raise requests.exceptions.Timeout(
                     "response body still arriving after the timeout"
-                )
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= self.max_response_bytes:
-                return b"".join(chunks)[: self.max_response_bytes], True
-        return b"".join(chunks), False
+                ) from exc
+            raise
+        finally:
+            watchdog.cancel()
 
     def post(self, payload: dict[str, Any] | list[Any]) -> GraphQLResponse:
         """Send a JSON GraphQL payload and return a normalised response.
