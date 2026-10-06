@@ -14,6 +14,11 @@ magnitude of a payload, and always honours a hard per-request timeout. Every
 probe is read-only with respect to the target unless you opt in to the one
 exception, described below.
 
+Two checks send a second request by design, and neither raises a payload's
+magnitude: the transport check repeats its document over POST so the two
+answers can be compared, and the directive check falls back to a second payload
+shape when the first is pre-empted by a spec rule.
+
 > ⚠️ **Authorized use only.** GDoS sends deliberately abusive (but bounded)
 > payloads. Only run it against endpoints you own or are explicitly authorized
 > to test.
@@ -25,7 +30,7 @@ exception, described below.
 | **Schema introspection exposure** | Whether the full schema is readable | Disable introspection in production |
 | **Field suggestion leakage** | Whether errors volunteer real field names | Mask suggestions in production errors |
 | **Automatic Persisted Queries** | Whether clients can register documents at runtime | Bound the APQ cache, or disable APQ |
-| **Query execution over GET** | Whether queries run outside POST | Accept POST only, or cover GET identically |
+| **Transport asymmetry (GET)** | Whether GET succeeds where POST is refused | Accept POST only, or cover GET identically |
 | **Query depth (deep nesting)** | Deeply nested selection sets | Reject queries past a max depth |
 | **Recursive introspection** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
 | **Alias-based amplification** | Hundreds/thousands of aliases of one field | Enforce an alias-count / node limit |
@@ -75,6 +80,9 @@ is ever consulted — so when GDoS sees that rule fire it re-probes with the
 second shape, which carries no repeats and therefore cannot be dismissed the
 same way. This is the only vector that may cost a second request.
 
+Of the 12 vectors, 4 map to catalogued CVEs (the ones above), 2 have a published
+advisory with no CVE identifier, and 6 have no advisory at all.
+
 2 further vectors have a published advisory but no CVE identifier:
 
 - **Automatic Persisted Queries.** Apollo Server enabled APQ by default backed
@@ -91,12 +99,13 @@ same way. This is the only vector that may cost a second request.
 
 The remaining 6 carry no advisory at all, for 2 different reasons. **Alias-based
 amplification**, **array request batching**, **schema introspection exposure**,
-**field suggestion leakage** and **query execution over GET** are not
-implementation bugs — they are defaults and deployment choices. A server that
-permits unlimited aliases, accepts unbounded batches, serves its full schema,
-suggests field names or answers queries over GET is behaving exactly as
-written. **Circular fragment spread** is the opposite case: rejecting it is
-mandatory under the GraphQL spec, so a server that executes one has a broken
+**field suggestion leakage** and **transport asymmetry** are not implementation
+bugs — they are defaults and deployment choices. A server that permits
+unlimited aliases, accepts unbounded batches, serves its full schema or
+suggests field names is behaving exactly as written, and a control that was
+only ever wired to one transport is a deployment oversight rather than a
+library flaw. **Circular fragment spread** is the opposite case: rejecting it
+is mandatory under the GraphQL spec, so a server that executes one has a broken
 validation phase rather than a catalogued vulnerability.
 
 Either way, patching a dependency does not close them, which is why GDoS probes
@@ -148,6 +157,39 @@ verdicts that merely reflect a tripped rate limiter or a downed host, and it
 stops GDoS from continuing to probe an endpoint that is already unwell. An
 aborted scan is always inconclusive, even if the checks that ran before it
 came back `PROTECTED`, because the vectors after the abort were never probed.
+
+### Comparisons, not assumptions
+
+Two of the surface checks would be wrong if they judged a single response on
+its own.
+
+**Executing a query over GET is not a defect.** The GraphQL-over-HTTP
+specification permits it for query operations, and plenty of hardened
+deployments allow it. What matters is whether the controls follow. GDoS
+therefore sends the identical document over both transports and compares:
+
+| GET | POST | Verdict |
+| --- | --- | --- |
+| refused (`405`/`404`/`501`) | — | `PROTECTED` — POST-only |
+| refused by a limit | — | `PROTECTED` — GET has controls of its own |
+| executed | refused by a limit | **`VULNERABLE`** — the control is attached to POST and is bypassed by moving the query into the URL |
+| executed | executed | `PROTECTED` for *this* vector: nothing is bypassed by changing transport. Whether an alias or complexity limit exists at all is answered by the alias-overloading check, not here |
+| `3xx` | — | `INCONCLUSIVE` — re-run against the final URL |
+
+**Incremental delivery has to be asked for.** `@defer` responses are
+content-negotiated, so a probe advertising `application/json` alone can be
+correctly refused by a server that fully supports unbounded `@defer`. The probe
+sends `Accept: multipart/mixed; deferSpec=20220824, application/json`; a `406`
+in reply to *that* is a real answer, and reported as `PROTECTED`.
+
+### Redirects
+
+Redirects are followed, because an endpoint published behind a canonical
+redirect — http to https, a missing trailing slash — is an ordinary deployment
+and refusing to follow one would fail the baseline and abandon the scan. The
+GET probe is the exception: there a `3xx` is itself the answer, and following it
+would test the policy at some other path or origin instead of the one named on
+the command line.
 
 ### Every probe is read-only, with one opt-in exception
 
@@ -288,7 +330,7 @@ gdos/
     amplification.py
     batching.py
     persisted.py   # Automatic Persisted Queries
-    transport.py   # GET execution, @defer, field suggestions
+    transport.py   # transport asymmetry, @defer, field suggestions
 tests/
   test_checks.py   # classification logic, stub-driven, no sockets
   test_surface_vectors.py

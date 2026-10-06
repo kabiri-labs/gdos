@@ -102,6 +102,26 @@ class PersistedQueryCheck(Check):
         if rejection is Rejection.RATE:
             return self._throttled(client, resp, baseline, "APQ")
 
+        # A server error says nothing about whether APQ exists, and may mean
+        # the probe broke the APQ path. Either way it is not protection.
+        if resp.status_code is not None and resp.status_code >= 500:
+            if endpoint_healthy(self._control(client)):
+                return self._result(
+                    Verdict.INCONCLUSIVE,
+                    f"Endpoint returned {resp.status_code} to an APQ request "
+                    "while still serving trivial queries. The APQ path errored "
+                    "rather than answering, so whether persisted queries are "
+                    "enabled could not be determined — a server error on a "
+                    "well-formed APQ request is worth investigating on its own.",
+                    resp,
+                    baseline,
+                    evidence={"apq": "errored", "control_probe": "healthy"},
+                    severity=Severity.MEDIUM,
+                )
+            return self._unreachable(
+                resp, baseline, f"The APQ probe returned {resp.status_code}"
+            )
+
         # Explicitly off, or not implemented: both are the hardened answer.
         if _mentions(resp, "persistedquerynotsupported", "persisted_query_not_supported"):
             return self._result(
@@ -114,6 +134,18 @@ class PersistedQueryCheck(Check):
                 severity=Severity.INFO,
             )
         if not _mentions(resp, "persistedquerynotfound", "persisted_query_not_found"):
+            # Only a clear, served answer supports concluding APQ is absent.
+            if resp.status_code is None or not 200 <= resp.status_code < 500:
+                return self._result(
+                    Verdict.INCONCLUSIVE,
+                    f"Unexpected answer to an APQ request (status "
+                    f"{resp.status_code}); whether persisted queries are "
+                    "enabled could not be determined.",
+                    resp,
+                    baseline,
+                    evidence={"apq": "unknown"},
+                    severity=Severity.LOW,
+                )
             return self._result(
                 Verdict.PROTECTED,
                 "Endpoint did not answer an APQ request with a cache-miss, so "
@@ -185,6 +217,17 @@ class PersistedQueryCheck(Check):
             return self._auth_wall(resp, baseline, "APQ registration")
         if rejection is Rejection.RATE:
             return self._throttled(client, resp, baseline, "APQ registration")
+        if resp.status_code is not None and resp.status_code >= 500:
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                f"Endpoint returned {resp.status_code} to the registration "
+                "probe, so whether it verifies hash/document pairs could not "
+                "be determined.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.LOW,
+            )
 
         if _mentions(
             resp,

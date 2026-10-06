@@ -55,15 +55,15 @@ class FakeClient:
             return self._responses.pop(0)
         return self._responses[0]
 
-    def query(self, query: str, variables=None) -> GraphQLResponse:
+    def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         self.queries.append(query)
         return self._next()
 
-    def post(self, payload) -> GraphQLResponse:
+    def post(self, payload, accept=None) -> GraphQLResponse:
         self.payloads.append(payload)
         return self._next()
 
-    def get(self, query: str, variables=None) -> GraphQLResponse:
+    def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         self.queries.append(query)
         return self._next()
 
@@ -560,17 +560,17 @@ class ScriptedClient:
         self._probe = probe
         self._control = control if control is not None else baseline
 
-    def query(self, query: str, variables=None) -> GraphQLResponse:
+    def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         if "GdosBaseline" in query:
             return self._baseline
         if "GdosControl" in query:
             return self._control
         return self._probe
 
-    def post(self, payload) -> GraphQLResponse:
+    def post(self, payload, accept=None) -> GraphQLResponse:
         return self._probe
 
-    def get(self, query: str, variables=None) -> GraphQLResponse:
+    def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         return self._probe
 
 
@@ -617,14 +617,14 @@ def test_failed_baseline_samples_are_excluded_from_the_median():
         def __init__(self) -> None:
             self.calls = 0
 
-        def query(self, query: str, variables=None) -> GraphQLResponse:
+        def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
             self.calls += 1
             return timed_out() if self.calls == 1 else healthy(0.10)
 
-        def post(self, payload) -> GraphQLResponse:
+        def post(self, payload, accept=None) -> GraphQLResponse:
             return healthy(0.10)
 
-        def get(self, query: str, variables=None) -> GraphQLResponse:
+        def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
             return healthy(0.10)
 
     scanner = Scanner(FlakyBaseline(), baseline_samples=3, delay=0)
@@ -654,7 +654,7 @@ class PhasedClient:
 
     url = "http://example.test/graphql"
 
-    def query(self, query: str, variables=None) -> GraphQLResponse:
+    def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         if "GdosBaseline" in query:
             return healthy()
         if "GdosIntrospectionProbe" in query:
@@ -664,10 +664,10 @@ class PhasedClient:
             )
         return timed_out()
 
-    def post(self, payload) -> GraphQLResponse:
+    def post(self, payload, accept=None) -> GraphQLResponse:
         return timed_out()
 
-    def get(self, query: str, variables=None) -> GraphQLResponse:
+    def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         return timed_out()
 
 
@@ -694,17 +694,17 @@ def test_abort_after_a_vulnerability_still_exits_one():
     class VulnerableThenDead:
         url = "http://example.test/graphql"
 
-        def query(self, query: str, variables=None) -> GraphQLResponse:
+        def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
             if "GdosBaseline" in query:
                 return healthy()
             if "GdosIntrospectionProbe" in query:
                 return gql(json={"data": {"__schema": {"types": [{"name": "Q"}]}}})
             return timed_out()
 
-        def post(self, payload) -> GraphQLResponse:
+        def post(self, payload, accept=None) -> GraphQLResponse:
             return timed_out()
 
-        def get(self, query: str, variables=None) -> GraphQLResponse:
+        def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
             return timed_out()
 
     report = Scanner(VulnerableThenDead(), baseline_samples=1, delay=0).run()

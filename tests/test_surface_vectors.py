@@ -29,22 +29,26 @@ class StubClient:
     def __init__(self, *responses: GraphQLResponse) -> None:
         self._responses = list(responses) or [gql()]
         self.calls: list[tuple[str, object]] = []
+        self.accepts: list[str | None] = []
 
     def _next(self) -> GraphQLResponse:
         if len(self._responses) > 1:
             return self._responses.pop(0)
         return self._responses[0]
 
-    def query(self, query: str, variables=None) -> GraphQLResponse:
+    def query(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         self.calls.append(("POST", query))
+        self.accepts.append(accept)
         return self._next()
 
-    def post(self, payload) -> GraphQLResponse:
+    def post(self, payload, accept=None) -> GraphQLResponse:
         self.calls.append(("POST", payload))
+        self.accepts.append(accept)
         return self._next()
 
-    def get(self, query: str, variables=None) -> GraphQLResponse:
+    def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         self.calls.append(("GET", query))
+        self.accepts.append(accept)
         return self._next()
 
     @property
@@ -137,6 +141,34 @@ def test_apq_unverified_hash_is_vulnerable():
     assert "One entry was registered" in result.summary
 
 
+def test_apq_server_error_is_not_protection():
+    """Regression: a 500 on the APQ path does not prove APQ is absent.
+
+    The absent branch fired on any response lacking a cache-miss marker, so a
+    server error became a PROTECTED verdict.
+    """
+    client = StubClient(gql(status=500, json=None), healthy())
+    result = PersistedQueryCheck().run(client, baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.evidence["apq"] == "errored"
+
+
+def test_apq_server_error_with_dead_control_aborts():
+    client = StubClient(
+        gql(status=500, json=None),
+        GraphQLResponse(status_code=None, elapsed=5.0, timed_out=True),
+    )
+    result = PersistedQueryCheck().run(client, baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert result.abort_scan is True
+
+
+def test_apq_registration_server_error_is_inconclusive():
+    client = StubClient(APQ_MISS, gql(status=503, json=None))
+    result = PersistedQueryCheck(allow_state_changing=True).run(client, baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
 def test_apq_behind_auth_is_inconclusive():
     resp = errors("Unauthorized", status=401)
     result = PersistedQueryCheck().run(StubClient(resp), baseline=0.05)
@@ -183,12 +215,55 @@ def test_get_rejected_is_protected():
     assert client.methods == ["GET"], "the check must probe the GET transport"
 
 
-def test_get_executed_is_vulnerable():
+def _executed(count: int) -> GraphQLResponse:
+    return gql(json={"data": {f"g{i}": "Query" for i in range(count)}})
+
+
+def test_get_executed_but_post_refused_is_vulnerable():
+    """The real finding: a control that applies to one transport only."""
     count = GetMethodCheck()._ALIAS_COUNT
-    resp = gql(json={"data": {f"g{i}": "Query" for i in range(count)}})
-    result = GetMethodCheck().run(StubClient(resp), baseline=0.05)
+    client = StubClient(
+        _executed(count),
+        errors("Too many aliases: maximum of 15 allowed", status=400),
+    )
+    result = GetMethodCheck().run(client, baseline=0.05)
+
     assert result.verdict is Verdict.VULNERABLE
-    assert result.evidence["aliases_resolved"] == count
+    assert client.methods == ["GET", "POST"], "both transports must be compared"
+    assert result.evidence["get_executed"] is True
+    assert result.evidence["post_executed"] is False
+
+
+def test_get_and_post_behaving_identically_is_not_a_finding():
+    """Regression: executing over GET is permitted by GraphQL-over-HTTP.
+
+    A conformant server with the same alias limit on both transports was
+    reported VULNERABLE purely for answering a GET, which flags correctly
+    hardened deployments.
+    """
+    count = GetMethodCheck()._ALIAS_COUNT
+    client = StubClient(_executed(count), _executed(count))
+    result = GetMethodCheck().run(client, baseline=0.05)
+
+    assert result.verdict is Verdict.PROTECTED
+    assert client.methods == ["GET", "POST"]
+    assert result.evidence["post_executed"] is True
+    # The summary must not read as "this endpoint is fine".
+    assert "alias-overloading check" in result.summary
+
+
+def test_get_comparison_blocked_by_auth_is_inconclusive():
+    count = GetMethodCheck()._ALIAS_COUNT
+    client = StubClient(_executed(count), errors("Unauthorized", status=401))
+    result = GetMethodCheck().run(client, baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+
+
+def test_get_redirect_is_inconclusive():
+    """A 3xx is an answer about a different location than the one under test."""
+    result = GetMethodCheck().run(StubClient(gql(status=308)), baseline=0.05)
+    assert result.verdict is Verdict.INCONCLUSIVE
+    assert "redirect" in result.summary.lower()
 
 
 def test_get_covered_by_limits_is_protected():
@@ -238,6 +313,28 @@ def test_defer_executed_as_plain_json_is_vulnerable():
     resp = gql(json={"data": {"__type": {"name": "String"}}})
     result = IncrementalDeliveryCheck().run(StubClient(resp), baseline=0.05)
     assert result.verdict is Verdict.VULNERABLE
+
+
+def test_defer_probe_requests_the_incremental_media_type():
+    """Regression: without a multipart Accept, a server may refuse to stream.
+
+    The probe used to go out with the session's `application/json`, so a
+    content-negotiating server answered 406 and the check called that
+    PROTECTED - missing exactly the servers it exists to find.
+    """
+    client = StubClient(errors("Unknown directive '@defer'.", status=400))
+    IncrementalDeliveryCheck().run(client, baseline=0.05)
+    assert client.accepts, "the probe must set an Accept header"
+    assert "multipart/mixed" in client.accepts[0]
+    assert "deferSpec" in client.accepts[0]
+
+
+def test_defer_406_after_asking_is_protected():
+    """Asked for the incremental type and told no: not a usable vector."""
+    result = IncrementalDeliveryCheck().run(
+        StubClient(gql(status=406)), baseline=0.05
+    )
+    assert result.verdict is Verdict.PROTECTED
 
 
 def test_defer_labels_are_unique():
