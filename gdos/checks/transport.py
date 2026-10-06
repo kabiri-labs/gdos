@@ -131,7 +131,7 @@ class GetMethodCheck(Check):
     """
 
     name = "get-method"
-    vector = "Query execution over GET"
+    vector = "Transport asymmetry (GET)"
     severity = Severity.MEDIUM
     remediation = (
         "Accept queries only over POST, or make sure every depth, complexity, "

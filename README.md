@@ -1,5 +1,9 @@
 # GDoS — GraphQL DoS Resilience Scanner
 
+[![Release](https://img.shields.io/github/v/release/kabiri-labs/gdos)](https://github.com/kabiri-labs/gdos/releases/latest)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 GDoS audits a GraphQL endpoint for **Denial-of-Service (DoS) amplification
 vulnerabilities** and reports whether the server enforces the protections a
 production deployment needs. Its purpose is *defensive*: to give security
@@ -29,14 +33,14 @@ shape when the first is pre-empted by a spec rule.
 | --- | --- | --- |
 | **Schema introspection exposure** | Whether the full schema is readable | Disable introspection in production |
 | **Field suggestion leakage** | Whether errors volunteer real field names | Mask suggestions in production errors |
-| **Automatic Persisted Queries** | Whether clients can register documents at runtime | Bound the APQ cache, or disable APQ |
+| **Automatic Persisted Queries cache** | Whether clients can register documents at runtime | Bound the APQ cache, or disable APQ |
 | **Transport asymmetry (GET)** | Whether GET succeeds where POST is refused | Accept POST only, or cover GET identically |
 | **Query depth (deep nesting)** | Deeply nested selection sets | Reject queries past a max depth |
-| **Recursive introspection** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
+| **Recursive introspection amplification** | Nested `fields → type → fields` introspection | Bound depth/complexity, even for introspection |
 | **Alias-based amplification** | Hundreds/thousands of aliases of one field | Enforce an alias-count / node limit |
-| **Field duplication** | The same field repeated many times | Count duplicates in a complexity budget |
+| **Field duplication amplification** | The same field repeated many times | Count duplicates in a complexity budget |
 | **Directive overloading** | A field annotated with thousands of directives, in both documented shapes | Limit directives / query token length |
-| **Incremental delivery overload** | Many `@defer` fragments in one document | Cap `@defer`/`@stream` per document |
+| **Incremental delivery overload (@defer)** | Many `@defer` fragments in one document | Cap `@defer`/`@stream` per document |
 | **Array request batching** | A JSON array of many operations in one request | Cap or disable batch size |
 | **Circular fragment spread** | A self-referential fragment (spec-forbidden) | Reject during validation |
 

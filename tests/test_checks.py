@@ -6,6 +6,9 @@ access (and no live GraphQL server) is required.
 
 from __future__ import annotations
 
+import pathlib
+import re
+
 import pytest
 
 from gdos.checks import (
@@ -572,6 +575,27 @@ class ScriptedClient:
 
     def get(self, query: str, variables=None, accept=None) -> GraphQLResponse:
         return self._probe
+
+
+def test_readme_vector_table_matches_the_registry():
+    """The README table and the report must name vectors identically.
+
+    `reporting` prints `CheckResult.vector`, so a table row that paraphrases it
+    leaves a reader unable to match the output against the documentation. This
+    drifted once: the table said "Transport asymmetry (GET)" while the report
+    still said "Query execution over GET".
+    """
+    readme = pathlib.Path(__file__).resolve().parents[1] / "README.md"
+    if not readme.is_file():
+        pytest.skip("README.md is not part of an installed package")
+
+    rows = re.findall(
+        r"^\| \*\*(.+?)\*\* \|", readme.read_text(encoding="utf-8"), re.M
+    )
+    assert rows == [c.vector for c in ALL_CHECKS], (
+        "the README vector table must list every check's `vector` verbatim, "
+        "in registry order"
+    )
 
 
 def test_every_check_has_a_transport_on_the_stubs():
