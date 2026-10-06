@@ -29,9 +29,44 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _redirect(self) -> None:
+        self.send_response(308)
+        self.send_header("Location", "/graphql/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _ok(self) -> None:
+        body = json.dumps({"data": {"__typename": "Query"}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        _BEHAVIOUR.setdefault("seen_accept", []).append(
+            self.headers.get("Accept", "")
+        )
+        if _BEHAVIOUR["mode"] == "redirect" and self.path.startswith("/graphql?"):
+            self._redirect()
+            return
+        self._ok()
+
     def do_POST(self) -> None:
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        _BEHAVIOUR.setdefault("seen_accept", []).append(
+            self.headers.get("Accept", "")
+        )
         mode = _BEHAVIOUR["mode"]
+
+        if mode == "redirect":
+            # A canonical trailing-slash redirect, which is an ordinary
+            # deployment rather than a fault.
+            if self.path == "/graphql":
+                self._redirect()
+            else:
+                self._ok()
+            return
 
         if mode == "small":
             body = json.dumps({"data": {"__typename": "Query"}}).encode()
@@ -215,6 +250,59 @@ def test_one_byte_over_the_cap_is_truncated(server):
 
     assert resp.truncated is True
     assert resp.bytes_read == cap
+
+
+def test_post_follows_a_canonical_redirect(server):
+    """Regression: refusing redirects on POST abandoned the whole scan.
+
+    An endpoint published behind an http-to-https or trailing-slash redirect is
+    ordinary. With redirects off, the baseline saw a 308 with no GraphQL data,
+    every sample was discarded and the scan reported the endpoint unscannable.
+    """
+    _BEHAVIOUR.clear()
+    _BEHAVIOUR.update(mode="redirect")
+    with GraphQLClient(server, timeout=10) as client:
+        resp = client.query("query GdosBaseline { __typename }")
+
+    assert resp.status_code == 200
+    assert resp.has_data, "the redirect should have been followed"
+
+
+def test_get_does_not_follow_a_redirect(server):
+    """The GET probe wants the endpoint's own answer, not the target's.
+
+    Following it would test the policy at some other path or origin.
+    """
+    _BEHAVIOUR.clear()
+    _BEHAVIOUR.update(mode="redirect")
+    with GraphQLClient(server, timeout=10) as client:
+        resp = client.get("query GdosGetProbe { __typename }")
+
+    assert resp.status_code == 308
+    assert resp.has_data is False
+
+
+def test_accept_header_can_be_overridden_per_request(server):
+    """Incremental delivery is content-negotiated and must be asked for."""
+    _BEHAVIOUR.clear()
+    _BEHAVIOUR.update(mode="small")
+    wanted = "multipart/mixed; deferSpec=20220824, application/json"
+    with GraphQLClient(server, timeout=10) as client:
+        client.query("query GdosBaseline { __typename }")
+        client.query("query GdosDeferProbe { __typename }", accept=wanted)
+
+    seen = _BEHAVIOUR["seen_accept"]
+    assert seen[0] == "application/json", "the default must stay unchanged"
+    assert seen[1] == wanted
+
+
+def test_content_type_is_recorded(server):
+    _BEHAVIOUR.clear()
+    _BEHAVIOUR.update(mode="small")
+    with GraphQLClient(server, timeout=10) as client:
+        resp = client.query("query GdosBaseline { __typename }")
+    assert resp.content_type.startswith("application/json")
+    assert resp.is_multipart is False
 
 
 def test_default_cap_is_applied():

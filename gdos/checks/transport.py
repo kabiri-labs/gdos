@@ -119,6 +119,13 @@ class GetMethodCheck(Check):
     attacker's side, and the response may additionally be cacheable by
     intermediaries.
 
+    Executing a query over GET is not itself a defect — the
+    GraphQL-over-HTTP specification permits it for query operations, and plenty
+    of hardened deployments allow it. The finding is *asymmetry*. So the same
+    document is sent over both transports and the answers compared: only a GET
+    that succeeds where POST was refused shows that a control was bypassed by
+    changing transport.
+
     The probe is deliberately small. What is under test is the endpoint's
     policy, not how long a URL it will take.
     """
@@ -139,7 +146,8 @@ class GetMethodCheck(Check):
 
     def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
         aliases = " ".join(f"g{i}: __typename" for i in range(self._ALIAS_COUNT))
-        resp = client.get("query GdosGetProbe { %s }" % aliases)
+        document = "query GdosGetProbe { %s }" % aliases
+        resp = client.get(document)
         evidence: dict[str, object] = {"alias_count": self._ALIAS_COUNT}
 
         if resp.error and not resp.timed_out:
@@ -163,7 +171,21 @@ class GetMethodCheck(Check):
                 )
             return self._unreachable(resp, baseline, "The GET probe timed out")
 
-        # 405 is the clean answer, and a size limit on the URL is also a limit.
+        # Redirects are deliberately not followed for this probe, so a 3xx is
+        # an answer about a different location than the one under test.
+        if resp.status_code is not None and 300 <= resp.status_code < 400:
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                f"Endpoint answered the GET probe with HTTP {resp.status_code}. "
+                "GDoS does not follow it here, because the policy at the "
+                "redirect target is not the policy under test — re-run "
+                "against the final URL.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.LOW,
+            )
+
         if resp.status_code in (405, 404, 501):
             return self._result(
                 Verdict.PROTECTED,
@@ -183,8 +205,8 @@ class GetMethodCheck(Check):
         if rejection in (Rejection.LIMIT, Rejection.SIZE) and not resp.has_data:
             return self._result(
                 Verdict.PROTECTED,
-                "Server rejected the GET query with a limit or size error — "
-                "GET is covered by the same controls as POST.",
+                "Server rejected the GET query with a limit or size error, so "
+                "GET is covered by controls of its own.",
                 resp,
                 baseline,
                 evidence=evidence,
@@ -192,19 +214,9 @@ class GetMethodCheck(Check):
             )
 
         if resp.ok and resp.has_data:
-            resolved = len(resp.data or {})
-            evidence["aliases_resolved"] = resolved
-            return self._result(
-                Verdict.VULNERABLE,
-                f"Server executed a {self._ALIAS_COUNT}-alias query sent in the "
-                f"URL and resolved {resolved} of them. Controls attached to "
-                "POST — body-size caps, WAF body rules, route-scoped rate "
-                "limits — do not apply on this path, and the response may be "
-                "cached by intermediaries.",
-                resp,
-                baseline,
-                evidence=evidence,
-            )
+            evidence["get_executed"] = True
+            evidence["aliases_resolved"] = len(resp.data or {})
+            return self._compare_with_post(client, resp, baseline, document, evidence)
 
         if rejection is Rejection.VALIDATION:
             return self._result(
@@ -223,6 +235,80 @@ class GetMethodCheck(Check):
             baseline,
             evidence=evidence,
             severity=Severity.LOW,
+        )
+
+    def _compare_with_post(
+        self,
+        client: GraphQLClient,
+        resp,
+        baseline: float,
+        document: str,
+        evidence: dict[str, object],
+    ) -> CheckResult:
+        """GET executed. Did POST refuse the identical document?
+
+        This is the comparison that separates "this endpoint serves GraphQL
+        over GET", which the specification allows, from "this endpoint's
+        controls can be stepped around by moving the query into the URL".
+        """
+        post = client.query(document)
+        evidence["post_status"] = post.status_code
+
+        if post.error or post.timed_out:
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                "The GET query executed, but the identical document could not "
+                f"be delivered over POST ({post.error or 'timed out'}), so the "
+                "two transports could not be compared.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.LOW,
+            )
+
+        post_rejection = classify_rejection(post)
+        if post_rejection in (Rejection.AUTH, Rejection.RATE):
+            return self._result(
+                Verdict.INCONCLUSIVE,
+                "The GET query executed, but POST answered the identical "
+                f"document with a {post_rejection.value} refusal, so the two "
+                "transports could not be compared on equal terms.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.LOW,
+            )
+
+        post_executed = post.ok and post.has_data
+        evidence["post_executed"] = post_executed
+
+        if post_executed:
+            return self._result(
+                Verdict.PROTECTED,
+                "Server executes queries over GET, which GraphQL-over-HTTP "
+                "permits, and answers the identical document over POST the "
+                "same way — no control is bypassed by changing transport. "
+                "Whether any alias or complexity limit exists at all is a "
+                "separate question, answered by the alias-overloading check.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.INFO,
+            )
+
+        return self._result(
+            Verdict.VULNERABLE,
+            f"POST refused the identical document (HTTP {post.status_code}, "
+            f"{post_rejection.value}) but GET executed it and resolved "
+            f"{evidence.get('aliases_resolved')} of {self._ALIAS_COUNT} "
+            "aliases. The deployment's controls are attached to POST and are "
+            "bypassed by moving the query into the URL — body-size caps, "
+            "WAF body rules and route-scoped rate limits all apply to one "
+            "transport only, and the GET response may additionally be cached "
+            "by intermediaries.",
+            resp,
+            baseline,
+            evidence=evidence,
         )
 
 
@@ -260,10 +346,30 @@ class IncrementalDeliveryCheck(Check):
         )
         return 'query GdosDeferProbe { __type(name: "String") { %s } }' % fragments
 
+    _ACCEPT = "multipart/mixed; deferSpec=20220824, application/json"
+    """Incremental delivery is content-negotiated. A server that is asked for
+    ``application/json`` alone may correctly refuse to stream, so a probe that
+    does not advertise the multipart type cannot observe @defer support at
+    all."""
+
     def run(self, client: GraphQLClient, baseline: float) -> CheckResult:
         count = self._scaled(low=50, medium=250, high=1000)
-        resp = client.query(self._build(count))
-        evidence: dict[str, object] = {"defer_count": count}
+        resp = client.query(self._build(count), accept=self._ACCEPT)
+        evidence: dict[str, object] = {"defer_count": count, "accept": self._ACCEPT}
+
+        # Asked for the incremental media type and told no: this server does
+        # not do incremental delivery, which is the hardened answer.
+        if resp.status_code == 406:
+            return self._result(
+                Verdict.PROTECTED,
+                "Server cannot produce an incremental-delivery response (HTTP "
+                "406) even when one is requested, so @defer is not a usable "
+                "vector against it.",
+                resp,
+                baseline,
+                evidence=evidence,
+                severity=Severity.INFO,
+            )
 
         # An incremental response is a multipart stream, not a JSON document,
         # so it will not parse. The stream arriving at all is the observation.

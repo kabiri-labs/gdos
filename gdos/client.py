@@ -211,11 +211,19 @@ class GraphQLClient:
         method: str,
         json_payload: dict[str, Any] | list[Any] | None = None,
         params: dict[str, str] | None = None,
+        accept: str | None = None,
+        follow_redirects: bool = True,
     ) -> GraphQLResponse:
         """Issue one request and normalise whatever comes back.
 
         Never raises for HTTP/network errors — failures are captured in the
         returned :class:`GraphQLResponse` so the scanner can reason about them.
+
+        Redirects are followed, as they were before this method existed. An
+        endpoint published behind a canonical redirect — http to https, a
+        missing trailing slash — is an ordinary deployment, and refusing to
+        follow one would fail the baseline and abandon the whole scan. Only the
+        GET probe opts out, because there a 3xx is itself the answer.
         """
         start = time.perf_counter()
         try:
@@ -224,10 +232,11 @@ class GraphQLClient:
                 self.url,
                 json=json_payload,
                 params=params,
+                headers={"Accept": accept} if accept else None,
                 timeout=self.timeout,
                 verify=self.verify_tls,
                 stream=True,
-                allow_redirects=False,
+                allow_redirects=follow_redirects,
             )
         except requests.exceptions.Timeout:
             return GraphQLResponse(
@@ -281,9 +290,17 @@ class GraphQLClient:
             bytes_read=len(body),
         )
 
-    def post(self, payload: dict[str, Any] | list[Any]) -> GraphQLResponse:
-        """Send a JSON GraphQL payload over POST."""
-        return self._send("POST", json_payload=payload)
+    def post(
+        self, payload: dict[str, Any] | list[Any], accept: str | None = None
+    ) -> GraphQLResponse:
+        """Send a JSON GraphQL payload over POST.
+
+        ``accept`` overrides the session's ``Accept`` header for this request
+        only, which some response formats have to be asked for: a server that
+        negotiates content will not return an incremental-delivery stream to a
+        client advertising ``application/json`` alone.
+        """
+        return self._send("POST", json_payload=payload, accept=accept)
 
     def get(
         self, query: str, variables: dict[str, Any] | None = None
@@ -297,15 +314,21 @@ class GraphQLClient:
         params = {"query": query}
         if variables:
             params["variables"] = jsonlib.dumps(variables)
-        return self._send("GET", params=params)
+        # Redirects are not followed here: a 3xx is the endpoint's answer about
+        # GET, and following one could silently move the probe to another path
+        # or origin whose policy is not the one under test.
+        return self._send("GET", params=params, follow_redirects=False)
 
     def query(
-        self, query: str, variables: dict[str, Any] | None = None
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        accept: str | None = None,
     ) -> GraphQLResponse:
         payload: dict[str, Any] = {"query": query}
         if variables:
             payload["variables"] = variables
-        return self.post(payload)
+        return self.post(payload, accept=accept)
 
     def close(self) -> None:
         self._session.close()
