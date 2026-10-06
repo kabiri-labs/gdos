@@ -74,11 +74,22 @@ class GraphQLResponse:
     timed_out: bool = False
     error: str | None = None
     """Set when the request never produced an HTTP response (network error)."""
+    content_type: str = ""
+    """The response's ``Content-Type`` header, lower-cased."""
     truncated: bool = False
     """The body hit the read cap. The server sent at least ``bytes_read``
     bytes, so the payload was answered at scale even though the body could not
     be parsed."""
     bytes_read: int = 0
+
+    @property
+    def is_multipart(self) -> bool:
+        """True for an incremental-delivery response (``multipart/mixed``).
+
+        Such a body is a stream of payloads rather than one JSON document, so
+        it will not parse — the stream itself is the observation.
+        """
+        return "multipart/" in self.content_type
 
     @property
     def ok(self) -> bool:
@@ -133,7 +144,7 @@ class GraphQLClient:
         default_headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "gdos-scanner/2.2 (+graphql-dos-resilience-scanner)",
+            "User-Agent": "gdos-scanner/2.3 (+graphql-dos-resilience-scanner)",
         }
         if headers:
             default_headers.update(headers)
@@ -195,20 +206,28 @@ class GraphQLClient:
         finally:
             watchdog.cancel()
 
-    def post(self, payload: dict[str, Any] | list[Any]) -> GraphQLResponse:
-        """Send a JSON GraphQL payload and return a normalised response.
+    def _send(
+        self,
+        method: str,
+        json_payload: dict[str, Any] | list[Any] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> GraphQLResponse:
+        """Issue one request and normalise whatever comes back.
 
         Never raises for HTTP/network errors — failures are captured in the
         returned :class:`GraphQLResponse` so the scanner can reason about them.
         """
         start = time.perf_counter()
         try:
-            resp = self._session.post(
+            resp = self._session.request(
+                method,
                 self.url,
-                json=payload,
+                json=json_payload,
+                params=params,
                 timeout=self.timeout,
                 verify=self.verify_tls,
                 stream=True,
+                allow_redirects=False,
             )
         except requests.exceptions.Timeout:
             return GraphQLResponse(
@@ -224,6 +243,7 @@ class GraphQLClient:
                 error=str(exc),
             )
 
+        content_type = resp.headers.get("Content-Type", "").lower()
         try:
             body, truncated = self._read_body(resp, start)
         except requests.exceptions.Timeout:
@@ -231,12 +251,14 @@ class GraphQLClient:
                 status_code=resp.status_code,
                 elapsed=time.perf_counter() - start,
                 timed_out=True,
+                content_type=content_type,
                 error=f"response body did not finish within {self.timeout}s",
             )
         except requests.exceptions.RequestException as exc:
             return GraphQLResponse(
                 status_code=resp.status_code,
                 elapsed=time.perf_counter() - start,
+                content_type=content_type,
                 error=str(exc),
             )
         finally:
@@ -254,9 +276,28 @@ class GraphQLClient:
             elapsed=elapsed,
             text=text[:2000],
             json=parsed,
+            content_type=content_type,
             truncated=truncated,
             bytes_read=len(body),
         )
+
+    def post(self, payload: dict[str, Any] | list[Any]) -> GraphQLResponse:
+        """Send a JSON GraphQL payload over POST."""
+        return self._send("POST", json_payload=payload)
+
+    def get(
+        self, query: str, variables: dict[str, Any] | None = None
+    ) -> GraphQLResponse:
+        """Send a query in the URL query string instead of a JSON body.
+
+        Used to find out whether limits and filters that a deployment applies
+        to POST also cover GET. Callers keep these payloads small: the point is
+        the endpoint's policy, not the size of a URL.
+        """
+        params = {"query": query}
+        if variables:
+            params["variables"] = jsonlib.dumps(variables)
+        return self._send("GET", params=params)
 
     def query(
         self, query: str, variables: dict[str, Any] | None = None

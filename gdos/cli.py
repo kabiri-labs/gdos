@@ -73,6 +73,13 @@ def build_parser() -> argparse.ArgumentParser:
              f"as evidence, not an error (default: {DEFAULT_MAX_RESPONSE_BYTES})",
     )
     parser.add_argument(
+        "--apq-register", action="store_true",
+        help="allow the persisted-query check to write one entry to the "
+             "target's APQ cache, which is what reveals whether the server "
+             "verifies hash/document pairs. This is the only probe that "
+             "changes state on the target, and it is off by default",
+    )
+    parser.add_argument(
         "--insecure", action="store_true",
         help="disable TLS certificate verification (not recommended)",
     )
@@ -153,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             intensity=args.intensity,
             baseline_samples=args.baseline_samples,
             delay=args.delay,
+            allow_state_changing=args.apq_register,
         )
         report = scanner.run()
     finally:
